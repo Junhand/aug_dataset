@@ -36,6 +36,13 @@ print(similar)  # 例: "Go to the shelf"
 python aug_instruction.py
 ```
 
+### 動画拡張
+
+```bash
+python aug_movie.py
+```
+
+
 スクリプト内の `dataset_path` を対象のLeRobotデータセットパスに変更してください。
 
 ## 設定
