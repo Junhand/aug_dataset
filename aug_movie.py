@@ -8,12 +8,9 @@ from tqdm import tqdm
 from PIL import Image
 from diffusers import QwenImageEditPlusPipeline
 
-model_id = "Wan-AI/Wan2.2-I2V-A14B-Diffusers"
-dtype = torch.bfloat16
-device = "cuda"
-
-pipe = WanImageToVideoPipeline.from_pretrained(model_id, torch_dtype=dtype)
-pipe.to(device)
+pipeline = QwenImageEditPlusPipeline.from_pretrained("Qwen/Qwen-Image-Edit-2511", torch_dtype=torch.bfloat16)
+pipeline.to('cuda')
+pipeline.set_progress_bar_config(disable=None)
 
 
 def edit_image(frame, noise_level=30):
@@ -22,30 +19,25 @@ def edit_image(frame, noise_level=30):
     #image1 = Image.open(tmp_image_name)
     image1 = Image.open(tmp_image_name).convert("RGB")
 
-    max_area = 480 * 832
-    aspect_ratio = image.height / image.width
-    mod_value = pipe.vae_scale_factor_spatial * pipe.transformer.config.patch_size[1]
-    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
-    image = image.resize((width, height))
-    prompt = "缶の色を赤色にしてください。"
+    prompt = "右から強い光が当たっている様子にして。"
 
-    negative_prompt = " "
-    generator = torch.Generator(device=device).manual_seed(0)
-    output = pipe(
-        image=image,
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        height=height,
-        width=width,
-        num_frames=81,
-        guidance_scale=3.5,
-        num_inference_steps=40,
-        generator=generator,
-    ).frames[0]
-    export_to_video(output, "i2v_output.mp4", fps=16)
+    inputs = {
+        "image": [image1],
+        "prompt": prompt,
+        "generator": torch.manual_seed(0),
+        "true_cfg_scale": 4.0,
+        "negative_prompt": " ",
+        "num_inference_steps": 40,
+        "guidance_scale": 1.0,
+        "num_images_per_prompt": 1,
+    }
+    with torch.inference_mode():
+        output = pipeline(**inputs)
+        output_image = output.images[0]
+        output_image.save("output_image_edit_2511.png")
+        print("image saved at", os.path.abspath("output_image_edit_2511.png"))
 
-    return np.clip(output, 0, 255).astype(np.uint8)
+    return np.clip(output_image, 0, 255).astype(np.uint8)
 
 
 def edit_image_noise(frame, noise_level=30):
@@ -73,17 +65,24 @@ def process_video_robust(input_path, output_path, noise_intensity=25):
     print(f"Processing: {input_path} -> {output_path}")
 
     # フレーム処理
+    i = 0
     for frame in tqdm(input_container.decode(video=0)):
+        i = i+1
+        print(f"{i}がスタート", flush=True)
         # 1. RGBのnumpy配列に変換
         img = frame.to_ndarray(format='rgb24')
         
         # 2. 加工処理（ノイズ付加）
         processed_img = edit_image(img, noise_level=noise_intensity)
+        print(processed_img, flush=True)
         
         # 3. 再びVideoFrameオブジェクトに戻して出力
         new_frame = av.VideoFrame.from_ndarray(processed_img, format='rgb24')
         for packet in output_video.encode(new_frame):
             output_container.mux(packet)
+        
+        if i>10:
+            break
 
     # 残りのパケットを書き出し
     for packet in output_video.encode():
