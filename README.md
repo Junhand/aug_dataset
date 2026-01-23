@@ -95,6 +95,54 @@ dataset_root/
 
 - `openai/gpt-oss-120b`: タスク指示生成用LLM（https://huggingface.co/openai/gpt-oss-120b）
 
-## ライセンス
+## tips
+```
+  File "aug_dataset/.venv/lib/python3.12/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py", line 1171, in get_image_features
+    split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2).tolist()
+                   ^^^^^^^^^^^^^^^^^^^^^^^
+```
+のエラー時は、
+``aug_dataset/.venv/lib/python3.12/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py``
+の1171行目を以下に修正する。
+```
+split_sizes = (image_grid_thw.to("cpu").prod(-1) // self.visual.spatial_merge_size**2).tolist()
+```
 
-MIT License
+## 静的解析・コード整形
+
+本プロジェクトでは、以下のツールを用いて **静的解析・コード整形** を行います。
+
+- **Ruff**：コードフォーマット・Lint
+- **mypy**：型チェック
+- **uv**：依存管理および実行環境
+- **Makefile**：コマンドの簡略化
+- **pre-commit**：コミット前チェック
+
+解析対象は **`src/` ディレクトリ配下のみ** です。
+
+---
+
+### 前提条件
+
+- `uv` がインストールされていること
+- 開発用依存関係が同期されていること
+
+```bash
+uv sync --dev
+```
+
+### 実行方法
+- 自動修正（フォーマット + Lint 修正）
+  ```
+  make fix
+  ```
+
+- チェック（修正せず検査のみ）
+  ```
+  make check
+  ```
+
+- コミット前に自動で静的解析（pre-commit）
+  ```
+  pre-commit install（1回のみ）
+  ```

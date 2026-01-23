@@ -1,0 +1,43 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      # 1) Ruff lint（自動修正）
+      - id: ruff
+        description: "Ruff lint (with fixes)"
+        args: ["--fix", "--exit-non-zero-on-fix"]
+        files: ^src/.*\.py$
+
+      # 2) Ruff format
+      - id: ruff-format
+        description: "Ruff format"
+        files: ^src/.*\.py$
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.1
+    hooks:
+      - id: mypy
+        description: "Run mypy"
+        args: ["--ignore-missing-imports"]
+        files: ^src/.*\.py$
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      # これらも src 配下だけに限定
+      - id: trailing-whitespace
+        files: ^src/
+
+      - id: end-of-file-fixer
+        files: ^src/
+
+      - id: check-merge-conflict
+        files: ^src/
+
+      # YAML は src 配下にあるものだけ
+      - id: check-yaml
+        files: ^src/.*\.ya?ml$
+
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+        files: ^src/
