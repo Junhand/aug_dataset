@@ -42,6 +42,21 @@ python aug_instruction.py
 python aug_movie.py
 ```
 
+### 全体拡張
+```
+uv run python src/augment_lerobot_dataset.py \
+  --src-repo-id hsr/2025-09_task05_absolute \
+  --src-root /home/group_25b505/group_5/.cache/huggingface/lerobot \
+  --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
+  --dst-root /home/group_25b505/group_5/.cache/huggingface/lerobot \
+  --noise-level 40 \
+  --num-aug-per-episode 2 \
+  --include-original \
+  --augment-instruction \
+  --offline
+```
+
+
 
 スクリプト内の `dataset_path` を対象のLeRobotデータセットパスに変更してください。
 
@@ -144,5 +159,5 @@ uv sync --dev
 
 - コミット前に自動で静的解析（pre-commit）
   ```
-  pre-commit install（1回のみ）
+  uv run pre-commit install（1回のみ）
   ```

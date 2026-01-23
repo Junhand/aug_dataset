@@ -108,16 +108,12 @@ def extract_instruction(episode: dict) -> str:
         task: str = episode["tasks"][0]
         return task
     except KeyError as e:
-        raise KeyError(
-            f"instructionが見つかりません。利用可能なキー: {list(episode.keys())}"
-        ) from e
+        raise KeyError(f"instructionが見つかりません。利用可能なキー: {list(episode.keys())}") from e
     except Exception:
         raise
 
 
-def generate_similar_instructions(
-    input_instruction: str, temperature: float = 0.8, max_tokens: int = 256
-) -> str:
+def generate_similar_instructions(input_instruction: str, temperature: float = 0.8, max_tokens: int = 256) -> str:
     """
     入力instructionから類似のinstructionを生成する
 
@@ -137,9 +133,7 @@ def generate_similar_instructions(
     )
 
     # サンプリングパラメータ設定
-    sampling_params = SamplingParams(
-        temperature=temperature, top_p=0.95, max_tokens=max_tokens
-    )
+    sampling_params = SamplingParams(temperature=temperature, top_p=0.95, max_tokens=max_tokens)
 
     # instructionモード用のプロンプト
     prompt = f"""You are an excellent task generation assistant.
@@ -184,6 +178,4 @@ if __name__ == "__main__":
 
     print("=== 単一instruction生成 ===")
     similar = generate_similar_instructions(instruction)
-    print(
-        f"元のインストラクション：{instruction}\n生成したインストラクション：{similar}"
-    )
+    print(f"元のインストラクション：{instruction}\n生成したインストラクション：{similar}")
