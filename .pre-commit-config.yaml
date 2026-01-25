@@ -18,7 +18,7 @@ repos:
     hooks:
       - id: mypy
         description: "Run mypy"
-        args: ["--ignore-missing-imports"]
+        args: ["--ignore-missing-imports", "--disable-error-code=import-untyped"]
         files: ^src/.*\.py$
 
   - repo: https://github.com/pre-commit/pre-commit-hooks

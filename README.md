@@ -15,10 +15,51 @@ LeRobot形式のデータセットからタスク指示（instruction）を読�
 ## インストール
 
 ```bash
-uv sync
+conda create --prefix ./.aug_env python=3.10
+conda activate 環境先
+conda install ffmpeg -c conda-forge
+pip install lerobot==0.4.3
+pip install vllm==0.10.1.1
+pip install av==15.1.0 numpy==2.2.6
+pip install requests python-dotenv
+pip install ruff mypy pre-commit
+
 ```
 
 ## 使用方法
+
+### vllmサーバの立ち上げ
+```
+sbatch vllm_server/serve_gpt-oss-120b.sh 
+```
+
+下記を自分の環境に合わせてください。
+```
+conda activate /home/group_25b505/group_5/kawagoshi/synthetic_dataset/aug_dataset/.aug_env
+```
+
+以下で、疎通確認をしてください。
+```
+curl -X POST http://aic-gh2b-310033:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "openai/gpt-oss-120b",
+    "messages": [
+      {
+        "role": "user",
+        "content": "日本の首都は？"
+      }
+    ],
+    "max_tokens": 1000,
+    "temperature": 0.7
+  }'
+```
+
+以下のような返答があれば、OKです。
+```
+{"id":"chatcmpl-bcd524af9a884fc88fba39f6b6a94551","object":"chat.completion","created":1769329277,"model":"openai/gpt-oss-120b","choices":[{"index":0,"message":{"role":"assistant","content":"日本の首都は東京（とうきょう）です。","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning_content":"The user asks in Japanese: \"日本の首都は？\" which means \"What is the capital of Japan?\" It's a straightforward factual question. No policy issue. Answer: Tokyo."},"logprobs":null,"finish_reason":"stop","stop_reason":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":77,"total_tokens":138,"completion_tokens":61,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_transfer_params":null}
+```
+
 
 ### 基本的な使用
 
@@ -44,15 +85,9 @@ python aug_movie.py
 
 ### 全体拡張
 ```
-uv run python src/augment_lerobot_dataset.py \
+python src/augment_lerobot_dataset.py \
   --src-repo-id hsr/2025-09_task05_absolute \
-  --src-root /home/group_25b505/group_5/.cache/huggingface/lerobot \
   --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
-  --dst-root /home/group_25b505/group_5/.cache/huggingface/lerobot \
-  --noise-level 40 \
-  --num-aug-per-episode 2 \
-  --include-original \
-  --augment-instruction \
   --offline
 ```
 

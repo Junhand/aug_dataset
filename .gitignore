@@ -9,4 +9,8 @@ wheels/
 # Virtual environments
 .venv
 .cache/*
+
+.*
+logs/*
 !log.txt
+!.env.sample

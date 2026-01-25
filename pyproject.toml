@@ -1,26 +1,6 @@
-[project]
-name = "aug-dataset"
-version = "0.1.0"
-description = "Add your description here"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-    "av>=15.1.0",
-    "lerobot>=0.4.3",
-    "numpy>=2.2.6",
-    "vllm>=0.10.1.1",
-]
-
-[dependency-groups]
-dev = [
-    "mypy>=1.19.1",
-    "pre-commit>=4.5.1",
-    "ruff>=0.14.14",
-]
-
-[tool.ruff]
+[ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py310"
 exclude = [
     ".git",
     ".venv",
@@ -30,7 +10,7 @@ exclude = [
     "alembic",
 ]
 
-[tool.ruff.lint]
+[ruff.lint]
 select = [
     "E",      # pycodestyle errors
     "W",      # pycodestyle warnings
@@ -42,11 +22,11 @@ select = [
 ]
 ignore = ["E501", "C901"]
 
-[tool.ruff.lint.isort]
+[ruff.lint.isort]
 known-first-party = ["src"]
 combine-as-imports = true
 
-[tool.mypy]
+[mypy]
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

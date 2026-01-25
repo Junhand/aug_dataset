@@ -3,22 +3,22 @@
 TARGET ?= ./src
 
 lint:
-	uv run ruff check $(TARGET)
+	ruff check $(TARGET)
 
 lint-fix:
-	uv run ruff check $(TARGET) --fix
+	ruff check $(TARGET) --fix
 
 format:
-	uv run ruff format $(TARGET)
+	ruff format $(TARGET)
 
 type:
-	uv run mypy $(TARGET)
+	mypy --ignore-missing-imports --disable-error-code=import-untyped $(TARGET)
 
 fix:
-	uv run ruff format $(TARGET)
-	uv run ruff check $(TARGET) --fix --unsafe-fixes
+	ruff format $(TARGET)
+	ruff check $(TARGET) --fix --unsafe-fixes
 	
 check:
-	uv run ruff format $(TARGET) --check
-	uv run ruff check $(TARGET)
-	uv run mypy $(TARGET)
+	ruff format $(TARGET) --check
+	ruff check $(TARGET)
+	mypy --ignore-missing-imports --disable-error-code=import-untyped $(TARGET)
