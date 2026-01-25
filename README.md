@@ -64,11 +64,15 @@ curl -X POST http://aic-gh2b-310033:8000/v1/chat/completions \
 ### 基本的な使用
 
 ```python
-from generate_similar_instruction import generate_similar_instructions
+cp .env.sample .env
+```
+vllmの情報を記入
 
-instruction = "Navigate to the shelf"
-similar = generate_similar_instructions(instruction)
-print(similar)  # 例: "Go to the shelf"
+```
+python src/augment_lerobot_dataset.py \
+  --src-repo-id hsr/2025-09_task05_absolute \
+  --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
+  --offline
 ```
 
 ### データセットから生成
@@ -90,8 +94,6 @@ python src/augment_lerobot_dataset.py \
   --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
   --offline
 ```
-
-
 
 スクリプト内の `dataset_path` を対象のLeRobotデータセットパスに変更してください。
 
