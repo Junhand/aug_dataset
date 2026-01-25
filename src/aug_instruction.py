@@ -143,7 +143,6 @@ You must output in the following JSON format:
 
 ### Similar task:
 """
-
     # 生成実行
     output = asyncio.run(llm.generate_text(prompt))
 
