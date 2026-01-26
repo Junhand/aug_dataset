@@ -1,8 +1,34 @@
 from pathlib import Path
+from tqdm import tqdm
 
 import av
 import numpy as np
-from tqdm import tqdm
+import torch
+
+
+def edit_image_gaussian_noise(
+    frame: torch.Tensor,
+    sigma: float = 0.5,
+) -> torch.Tensor:
+    """
+    入力:
+      frame: torch.Tensor (C, H, W), 値域 [0, 1]
+
+    処理:
+      - ガウシアンノイズ N(0, sigma^2) を加算
+      - clamp [0, 1]
+      - CHW -> HWC
+
+    出力:
+      torch.Tensor (H, W, C), 値域 [0, 1]
+    """
+    # ガウシアンノイズ
+    noise = torch.randn_like(frame) * sigma
+    frame_noisy = torch.clamp(frame + noise, 0.0, 1.0)
+
+    # CHW -> HWC
+    frame_noisy_hwc = frame_noisy.permute(1, 2, 0)
+    return frame_noisy_hwc
 
 
 def edit_image_noise(frame, noise_level=30):

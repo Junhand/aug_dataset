@@ -91,7 +91,7 @@ python aug_movie.py
 ```
 python src/augment_lerobot_dataset.py \
   --src-repo-id hsr/2025-09_task05_absolute \
-  --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
+  --dst-repo-id hsr/2025-09_task05_absolute_aug-task_and_aug-image-gaussan-noise \
   --offline
 ```
 
