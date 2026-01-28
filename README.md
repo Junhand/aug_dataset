@@ -46,14 +46,6 @@ pip install -e .
 pip install einops decord pycocotools
 ```
 
-```bash
-cd ../..
-python src/qwen_2511_with_distill_lora_server.py
-```
-
-```bash
-python /home/group_25b505/group_5/kawagoshi/synthetic_dataset/aug_dataset/src/qwen_2511_with_distill_lora.py
-```
 
 ## エラー対応
 - ``Disk quota exceeded``の場合は、``aug_dataset/.tmp``のようにtmp先を変更するか、``pip install lerobot==0.4.3 --no-cache-dir``のように``--no-cache-dir``をつけてください。
@@ -94,13 +86,17 @@ curl -X POST http://aic-gh2b-310033:8000/v1/chat/completions \
 {"id":"chatcmpl-bcd524af9a884fc88fba39f6b6a94551","object":"chat.completion","created":1769329277,"model":"openai/gpt-oss-120b","choices":[{"index":0,"message":{"role":"assistant","content":"日本の首都は東京（とうきょう）です。","refusal":null,"annotations":null,"audio":null,"function_call":null,"tool_calls":[],"reasoning_content":"The user asks in Japanese: \"日本の首都は？\" which means \"What is the capital of Japan?\" It's a straightforward factual question. No policy issue. Answer: Tokyo."},"logprobs":null,"finish_reason":"stop","stop_reason":null}],"service_tier":null,"system_fingerprint":null,"usage":{"prompt_tokens":77,"total_tokens":138,"completion_tokens":61,"prompt_tokens_details":null},"prompt_logprobs":null,"kv_transfer_params":null}
 ```
 
+### qwen-edit-image & sam3サーバの立ち上げ
+```bash
+sbatch run_augment_lerobot_dataset.sh
+```
 
 ### 基本的な使用
 
 ```python
 cp .env.sample .env
 ```
-vllmの情報を記入
+.envに、vllmの情報を記入
 
 ```
 python src/augment_lerobot_dataset.py \
@@ -110,6 +106,8 @@ python src/augment_lerobot_dataset.py \
   --offline \
   --use-batch 
 ```
+スクリプト内の `dataset_path` を対象のLeRobotデータセットパスに変更してください。
+
 
 ### データセットから生成
 
@@ -125,13 +123,8 @@ python aug_movie.py
 
 ### 全体拡張
 ```
-python src/augment_lerobot_dataset.py \
-  --src-repo-id hsr/2025-09_task05_absolute \
-  --dst-repo-id hsr/2025-09_task05_absolute_aug-task_and_aug-image-gaussan-noise \
-  --offline
+sbatch run_augment_lerobot_dataset.sh
 ```
-
-スクリプト内の `dataset_path` を対象のLeRobotデータセットパスに変更してください。
 
 ## 設定
 
