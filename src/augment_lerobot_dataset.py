@@ -28,6 +28,22 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 
+SEGMENT_TASKS = "shelf, object, pet bottle, container, box"
+# SEGMENT_TASKS = "oven, bread, dish, table, plate"
+
+
+def build_prompt(task: str) -> tuple[str, str]:
+    prompt = (
+        "Make minimal and subtle changes to only small, task-irrelevant regions of the background. "
+        "Keep most of the original background unchanged. "
+        "Preserve the same indoor setting, materials, scene context, objects, and overall atmosphere. "
+        f"Task: {task}"
+    )
+
+    negative_prompt = " "
+    return prompt, negative_prompt
+
+
 class QwenImageEditClient:
     """Client for Qwen-Image-Edit API."""
 
@@ -70,10 +86,11 @@ class QwenImageEditClient:
         seed: int = 42,
     ) -> torch.Tensor:
         """Edit single image. Input/Output: CHW tensor [0,1]."""
+
         payload = {
             "image_tensor_b64": self.tensor_to_base64(image_tensor),
             "prompt": prompt,
-            "task": task,
+            "task": SEGMENT_TASKS,
             "seed": seed,
         }
         if negative_prompt:
@@ -143,13 +160,7 @@ def edit_image_with_api(
 
 def create_image_transform_with_api(task: str, seed: int = 42):
     """Create image transform function with API call."""
-    prompt = (
-        f"Change only the task-irrelevant background. "
-        f"Keep the robot, manipulated objects, and their interaction exactly the same. "
-        f"Replace the background with a very similar environment. "
-        f"Task: {task}"
-    )
-    negative_prompt = " "
+    prompt, negative_prompt = build_prompt(task)
 
     def transform(frame: torch.Tensor) -> torch.Tensor:
         return edit_image_with_api(frame, task, prompt, negative_prompt, seed)
@@ -203,7 +214,7 @@ def process_frame(
 
 def process_frames_batch_parallel(
     frames: list[dict],
-    new_task: str,
+    task: str,
     max_workers: int = 4,
     seed_base: int = 42,
 ) -> list[dict]:
@@ -212,7 +223,7 @@ def process_frames_batch_parallel(
 
     Args:
         frames: フレームのリスト
-        new_task: 新しいタスク名
+        task: タスク名
         max_workers: 並列ワーカー数
         seed_base: シードのベース値
 
@@ -221,14 +232,7 @@ def process_frames_batch_parallel(
     """
     client = get_api_client()
 
-    prompt = (
-        f"Change only the task-irrelevant background. "
-        f"Replace the background with an environment that is very similar to the original one, "
-        f"preserving the same indoor setting, layout, materials, lighting conditions, and overall atmosphere. "
-        f"Do not change the scene context."
-        f"Task: {new_task}"
-    )
-    negative_prompt = None
+    prompt, negative_prompt = build_prompt(task)
 
     results: list[dict] = [{} for _ in range(len(frames))]
 
@@ -246,7 +250,7 @@ def process_frames_batch_parallel(
             }:
                 continue
             if "task" in key:
-                new_frame[key] = new_task
+                new_frame[key] = task
 
             elif key == "observation.image.hand":
                 # 左に90度回転（反時計回り）
@@ -254,7 +258,7 @@ def process_frames_batch_parallel(
                 roted_cwh = torch.rot90(value, k=1, dims=(1, 2))
                 # Edit Image
                 edited_cwh = client.edit_image(
-                    roted_cwh, new_task, prompt, negative_prompt, seed
+                    roted_cwh, task, prompt, negative_prompt, seed
                 )
                 # (C, W, H) -> (C, H, W)
                 edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
@@ -263,9 +267,7 @@ def process_frames_batch_parallel(
 
             elif "observation.image" in key:
                 # CHW tensor -> API -> HWC tensor
-                edited = client.edit_image(
-                    value, new_task, prompt, negative_prompt, seed
-                )
+                edited = client.edit_image(value, task, prompt, negative_prompt, seed)
                 new_frame[key] = edited.permute(1, 2, 0)
             else:
                 new_frame[key] = value
@@ -316,11 +318,12 @@ def augment_dataset(
 
     start = time.time()
     meta_episodes = original_ds.meta.episodes
-    num_episodes = 3  # len(meta_episodes["dataset_from_index"])
+    num_episodes = 1  # len(meta_episodes["dataset_from_index"])
 
     logger.info(f"Adding copy of {num_episodes} episodes using API at {api_url}")
 
     for ep_idx in tqdm(range(num_episodes), desc="Augment episodes"):
+        ep_idx = 2
         start_idx = meta_episodes["dataset_from_index"][ep_idx]
         end_idx = meta_episodes["dataset_to_index"][ep_idx]
         new_task = generate_similar_instructions(original_ds[start_idx]["task"])

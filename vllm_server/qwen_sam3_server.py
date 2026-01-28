@@ -100,10 +100,6 @@ class SAM3Segmenter:
         """
         state = self.processor.set_image(image)
 
-        # Segment shelf
-        out_shelf = self.processor.set_text_prompt(state=state, prompt="shelf")
-        shelf_mask = self._get_mask_or_empty(out_shelf)
-
         # Segment robot (try multiple prompts)
         robot_mask = None
         for prompt in [
@@ -123,22 +119,9 @@ class SAM3Segmenter:
         # Segment manipulated objects based on task keywords
         object_mask = None
         task_lower = task.lower()
-        object_prompts = []
+        object_prompts = [s.strip() for s in task_lower.split(",")]
 
         # Extract potential objects from task
-        if "toaster" in task_lower:
-            object_prompts.append("toaster")
-        if "oven" in task_lower:
-            object_prompts.append("oven")
-        if "drawer" in task_lower:
-            object_prompts.append("drawer")
-        if "door" in task_lower:
-            object_prompts.append("door")
-        if "cup" in task_lower:
-            object_prompts.append("cup")
-        if "bottle" in task_lower:
-            object_prompts.append("bottle")
-
         for prompt in object_prompts:
             out_obj = self.processor.set_text_prompt(state=state, prompt=prompt)
             m = self._get_mask_or_empty(out_obj)
@@ -149,7 +132,7 @@ class SAM3Segmenter:
                     object_mask = object_mask | m
 
         # Merge all masks
-        masks = [m for m in [shelf_mask, robot_mask, object_mask] if m is not None]
+        masks = [m for m in [robot_mask, object_mask] if m is not None]
 
         if not masks:
             return None
@@ -165,37 +148,50 @@ def composite_images(
     original: Image.Image,
     edited: Image.Image,
     mask: torch.Tensor,
+    overlay_alpha: float = 0.3,   # 赤の薄さ（0.2〜0.4がおすすめ）
 ) -> Image.Image:
     """
-    Composite original and edited images using mask.
+    Composite original and edited images using mask,
+    and visualize masked region with a light red overlay.
 
     Args:
         original: Original PIL image
         edited: Edited PIL image (may be different size)
         mask: (H, W) bool tensor where True = keep original
+        overlay_alpha: transparency of red overlay on masked area
 
     Returns:
         Composited PIL image (same size as original)
     """
-    original_np = np.array(original)
+    original_np = np.array(original).astype(np.float32)
     h, w = original_np.shape[:2]
 
     # Resize edited to match original size
     if edited.size != (w, h):
         edited = edited.resize((w, h), Image.LANCZOS)
-    edited_np = np.array(edited)
+    edited_np = np.array(edited).astype(np.float32)
 
     # Resize mask if needed
-    mask_np = mask.cpu().numpy()
+    mask_np = mask.detach().cpu().numpy()
     if mask_np.shape != (h, w):
         mask_pil = Image.fromarray(mask_np.astype(np.uint8) * 255)
         mask_pil = mask_pil.resize((w, h), Image.NEAREST)
         mask_np = np.array(mask_pil) > 127
 
-    # Composite: keep original where mask is True, use edited elsewhere
+    # ① Composite: keep original where mask=True
     result = edited_np.copy()
     result[mask_np] = original_np[mask_np]
 
+    # ② Red overlay on masked area (visualization only)
+    red = np.zeros_like(result)
+    red[..., 0] = 255  # Red channel
+
+    result[mask_np] = (
+        (1.0 - overlay_alpha) * result[mask_np]
+        + overlay_alpha * red[mask_np]
+    )
+
+    result = np.clip(result, 0, 255).astype(np.uint8)
     return Image.fromarray(result)
 
 
