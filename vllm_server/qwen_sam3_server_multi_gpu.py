@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 MAX_QUEUE_SIZE = 1000
 REQUEST_TIMEOUT = 300
 NUM_GPUS = 8
+JPEG_QUALITY = 95  # High quality JPEG for faster serialization
 
 # Model paths
 MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
@@ -226,9 +227,9 @@ def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue
                 else:
                     output_pil = edited_pil
 
-            # Encode result
+            # Encode result (JPEG for faster serialization)
             output_buffer = io.BytesIO()
-            output_pil.save(output_buffer, format="PNG")
+            output_pil.save(output_buffer, format="JPEG", quality=95)
             output_bytes = output_buffer.getvalue()
 
             result_queue.put((job_id, output_bytes, None))
@@ -305,12 +306,12 @@ class MultiGPUManager:
         loop = asyncio.get_event_loop()
         while True:
             try:
-                # Non-blocking check with timeout
+                # Non-blocking check with short timeout
                 result = await loop.run_in_executor(
                     None, self._get_result_with_timeout
                 )
                 if result is None:
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.001)  # 1ms sleep for faster response
                     continue
                 
                 job_id, output_bytes, error = result
@@ -326,12 +327,12 @@ class MultiGPUManager:
                 break
             except Exception as e:
                 print(f"[Main] Result collector error: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.01)
 
     def _get_result_with_timeout(self):
-        """Get result from queue with timeout."""
+        """Get result from queue with short timeout."""
         try:
-            return self.result_queue.get(timeout=0.1)
+            return self.result_queue.get(timeout=0.01)  # 10ms timeout
         except:
             return None
 
@@ -361,10 +362,10 @@ class MultiGPUManager:
 
         original_h, original_w = input_tensor.shape[1], input_tensor.shape[2]
 
-        # Convert tensor to image bytes
+        # Convert tensor to image bytes (JPEG for faster serialization)
         input_pil = tensor_to_pil(input_tensor)
         buffer = io.BytesIO()
-        input_pil.save(buffer, format="PNG")
+        input_pil.save(buffer, format="JPEG", quality=JPEG_QUALITY)
         image_bytes = buffer.getvalue()
 
         # Create future for this job
