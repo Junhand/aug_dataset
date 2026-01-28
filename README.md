@@ -12,19 +12,53 @@ LeRobot形式のデータセットからタスク指示（instruction）を読�
 - vLLM
 - CUDA対応GPU
 
-## インストール
+## データセット拡張の実行環境インストール
 
 ```bash
 conda create --prefix ./.aug_env python=3.10
-conda activate 環境先
+conda activate .aug_envの環境先
 conda install ffmpeg -c conda-forge
-pip install lerobot==0.4.3
-pip install vllm==0.10.1.1
-pip install av==15.1.0 numpy==2.2.6
-pip install requests python-dotenv
-pip install ruff mypy pre-commit
-
+pip install -r requirements.txt
+# pip install vllm==0.10.1.1
+# pip install lerobot==0.4.3
+# pip install av==15.1.0 numpy==2.2.6
+# pip install requests python-dotenv
+# pip install ruff mypy pre-commit
 ```
+
+## 画像拡張モデルの環境インストール
+Qwen-Image-Edit-2511の利用
+```bash
+conda create --prefix ./.edit_env python=3.12
+conda activate .image_envの環境先
+
+pip install diffusers accelerate transformers
+pip install "huggingface_hub[cli]"
+
+# モデルのインストール
+huggingface-cli download lightx2v/Qwen-Image-Edit-2511-Lightning --local-dir ./Qwen-Image-Edit-Lightning
+pip install torch torchvision peft
+pip install uvicorn[standard] fastapi[all] pillow pydantic
+
+git clone https://github.com/facebookresearch/sam3.git
+cd sam3
+pip install -e .
+pip install einops decord pycocotools
+```
+
+```bash
+cd ../..
+python src/qwen_2511_with_distill_lora_server.py
+```
+
+```bash
+python /home/group_25b505/group_5/kawagoshi/synthetic_dataset/aug_dataset/src/qwen_2511_with_distill_lora.py
+```
+
+## エラー対応
+- ``Disk quota exceeded``の場合は、``aug_dataset/.tmp``のようにtmp先を変更するか、``pip install lerobot==0.4.3 --no-cache-dir``のように``--no-cache-dir``をつけてください。
+- ``prod(-1)``のエラーが出る場合は、``.cpu().prod(-1)``として、CPUで処理してください。
+
 
 ## 使用方法
 
@@ -72,7 +106,9 @@ vllmの情報を記入
 python src/augment_lerobot_dataset.py \
   --src-repo-id hsr/2025-09_task05_absolute \
   --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
-  --offline
+  --max-workers 32 \
+  --offline \
+  --use-batch 
 ```
 
 ### データセットから生成
@@ -174,16 +210,7 @@ split_sizes = (image_grid_thw.to("cpu").prod(-1) // self.visual.spatial_merge_si
 
 ---
 
-### 前提条件
-
-- `uv` がインストールされていること
-- 開発用依存関係が同期されていること
-
-```bash
-uv sync --dev
-```
-
-### 実行方法
+### 静的解析実行方法
 - 自動修正（フォーマット + Lint 修正）
   ```
   make fix

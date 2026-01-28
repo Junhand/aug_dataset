@@ -5,14 +5,15 @@ import os
 import logging
 import torch
 import time
-import multiprocessing as mp
-import psutil
+import io
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.dataset_tools import merge_datasets
 from aug_instruction import generate_similar_instructions
-from aug_movie import edit_image_gaussian_noise
 
+import requests
 from tqdm import tqdm
 from typing import Optional, Callable
 
@@ -27,75 +28,133 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 
-def _process_batch(args):
-    """バッチ処理（GPU割り当て）"""
-    worker_id, batch, new_task, num_gpus = args
+class QwenImageEditClient:
+    """Client for Qwen-Image-Edit API."""
 
-    # GPU割り当て
-    if num_gpus > 0:
-        gpu_id = worker_id % num_gpus
-        torch.cuda.set_device(gpu_id)
-        device = torch.device(f"cuda:{gpu_id}")
-    else:
-        device = torch.device("cpu")
+    def __init__(
+        self,
+        base_url: str = "http://localhost:8000",
+        timeout: int = 300,
+        pool_size: int = 250,
+    ):
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+        self.session = requests.Session()
 
-    results = []
-    for idx, frame_data in batch:
-        # GPU に移動
-        if num_gpus > 0:
-            frame_data = {
-                k: v.to(device) if isinstance(v, torch.Tensor) else v
-                for k, v in frame_data.items()
-            }
-
-        new_frame = process_frame(
-            frame_data,
-            task_transform=lambda x: new_task,
-            image_transform=edit_image_gaussian_noise,
+        # Increase connection pool size
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=pool_size,
+            pool_maxsize=pool_size,
         )
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
 
-        # CPU に戻す
-        new_frame = {
-            k: v.cpu() if isinstance(v, torch.Tensor) else v
-            for k, v in new_frame.items()
+    @staticmethod
+    def tensor_to_base64(tensor: torch.Tensor) -> str:
+        buffer = io.BytesIO()
+        torch.save(tensor, buffer)
+        buffer.seek(0)
+        return base64.b64encode(buffer.read()).decode("utf-8")
+
+    @staticmethod
+    def base64_to_tensor(b64_str: str) -> torch.Tensor:
+        buffer = io.BytesIO(base64.b64decode(b64_str))
+        return torch.load(buffer, weights_only=True)
+
+    def edit_image(
+        self,
+        image_tensor: torch.Tensor,
+        task: str,
+        prompt: str,
+        negative_prompt: Optional[str] = None,
+        seed: int = 42,
+    ) -> torch.Tensor:
+        """Edit single image. Input/Output: CHW tensor [0,1]."""
+        payload = {
+            "image_tensor_b64": self.tensor_to_base64(image_tensor),
+            "prompt": prompt,
+            "task": task,
+            "seed": seed,
         }
-        results.append((idx, new_frame))
+        if negative_prompt:
+            payload["negative_prompt"] = negative_prompt
 
-    return results
-
-
-def parallel_process_frames(frames, new_task, num_workers=None):
-    """並列フレーム処理（順序保証・高速版）"""
-    num_gpus = torch.cuda.device_count()
-    if num_workers is None:
-        num_workers = num_gpus or 1
-
-    total = len(frames)
-    print(f"Using {num_workers} workers, {num_gpus} GPUs, processing {total} frames")
-
-    # バッチに分割
-    batch_size = max(1, total // num_workers)
-    batches = []
-    for i in range(num_workers):
-        start = i * batch_size
-        end = start + batch_size if i < num_workers - 1 else total
-        if start < total:
-            batches.append((i, frames[start:end], new_task, num_gpus))
-
-    # 並列処理
-    ctx = mp.get_context("spawn")
-    with ctx.Pool(num_workers) as pool:
-        batch_results = list(
-            tqdm(
-                pool.imap_unordered(_process_batch, batches),
-                total=len(batches),
-                desc="Processing",
-            )
+        resp = self.session.post(
+            f"{self.base_url}/edit", json=payload, timeout=self.timeout
         )
+        if resp.status_code != 200:
+            raise RuntimeError(f"API error: {resp.status_code} - {resp.text}")
 
-    # 結果をフラット化してソート
-    results = [item for batch in batch_results for item in batch]
-    return sorted(results, key=lambda x: x[0])
+        result = resp.json()
+        return self.base64_to_tensor(result["image_tensor_b64"])
+
+    def health_check(self) -> bool:
+        try:
+            resp = self.session.get(f"{self.base_url}/health", timeout=5)
+            return resp.status_code == 200 and resp.json().get("ready", False)
+        except requests.RequestException:
+            return False
+
+
+# Global client instance
+_api_client: Optional[QwenImageEditClient] = None
+
+
+def get_api_client(base_url: str = "http://localhost:8000") -> QwenImageEditClient:
+    """Get or create API client singleton."""
+    global _api_client
+    if _api_client is None:
+        _api_client = QwenImageEditClient(base_url)
+        if not _api_client.health_check():
+            raise RuntimeError(f"API server not available at {base_url}")
+        logger.info(f"Connected to API server at {base_url}")
+    return _api_client
+
+
+def edit_image_with_api(
+    frame: torch.Tensor,
+    task: str,
+    prompt: str,
+    negative_prompt: Optional[str] = None,
+    seed: int = 42,
+) -> torch.Tensor:
+    """
+    入力:
+      frame: torch.Tensor (C, H, W), 値域 [0, 1]
+      prompt: 編集指示
+
+    処理:
+      - APIを呼び出して画像を編集
+
+    出力:
+      torch.Tensor (C, H, W), 値域 [0, 1]
+    """
+    client = get_api_client()
+    # API call (CHW -> CHW)
+    edited_chw = client.edit_image(
+        image_tensor=frame,
+        task=task,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        seed=seed,
+    )
+    return edited_chw
+
+
+def create_image_transform_with_api(task: str, seed: int = 42):
+    """Create image transform function with API call."""
+    prompt = (
+        f"Change only the task-irrelevant background. "
+        f"Keep the robot, manipulated objects, and their interaction exactly the same. "
+        f"Replace the background with a very similar environment. "
+        f"Task: {task}"
+    )
+    negative_prompt = " "
+
+    def transform(frame: torch.Tensor) -> torch.Tensor:
+        return edit_image_with_api(frame, task, prompt, negative_prompt, seed)
+
+    return transform
 
 
 def process_frame(
@@ -103,20 +162,9 @@ def process_frame(
     task_transform: Optional[Callable] = None,
     image_transform: Optional[Callable] = None,
 ) -> dict:
-    """Process frame: remove skip keys and apply transforms.
-
-    Args:
-        frame: Original frame dict from LeRobotDataset
-        task_transform: Function to transform task value (default: identity)
-        image_transform: Function to transform image value (default: permute to HWC)
-
-    Returns:
-        Processed frame dict ready for add_frame()
-    """
-    # metadataを指定
+    """Process frame: remove skip keys and apply transforms."""
     SKIP_KEYS = {"index", "episode_index", "timestamp", "frame_index", "task_index"}
 
-    # Default transforms
     if task_transform is None:
 
         def task_transform(x):
@@ -125,93 +173,191 @@ def process_frame(
     if image_transform is None:
 
         def image_transform(x):
-            return x.permute(1, 2, 0)  # [C, H, W] -> [H, W, C]
+            return x.permute(1, 2, 0)
 
     new_frame = {}
     for key, value in frame.items():
-        # Skip metadata keys managed by LeRobotDataset
         if key in SKIP_KEYS:
             continue
 
-        # Apply transforms based on key type
         if "task" in key:
             value = task_transform(value)
+        elif key == "observation.image.hand":
+            # 左に90度回転（反時計回り）
+            # (C, H, W) -> (C, W, H)
+            roted_cwh = torch.rot90(value, k=1, dims=(1, 2))
+            # Edit Image
+            edited_cwh = image_transform(roted_cwh)
+            # (C, W, H) -> (C, H, W)
+            edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
+
+            value = edited_chw.permute(1, 2, 0)  # CHW -> HWC
+
         elif "observation.image" in key:
-            value = image_transform(value)
+            edited_chw = image_transform(value)
+            value = edited_chw.permute(1, 2, 0)  # CHW -> HWC
 
         new_frame[key] = value
     return new_frame
 
 
+def process_frames_batch_parallel(
+    frames: list[dict],
+    new_task: str,
+    max_workers: int = 4,
+    seed_base: int = 42,
+) -> list[dict]:
+    """
+    複数フレームを並列でAPI処理する。
+
+    Args:
+        frames: フレームのリスト
+        new_task: 新しいタスク名
+        max_workers: 並列ワーカー数
+        seed_base: シードのベース値
+
+    Returns:
+        処理済みフレームのリスト（順序保証）
+    """
+    client = get_api_client()
+
+    prompt = (
+        f"Change only the task-irrelevant background. "
+        f"Replace the background with an environment that is very similar to the original one, "
+        f"preserving the same indoor setting, layout, materials, lighting conditions, and overall atmosphere. "
+        f"Do not change the scene context."
+        f"Task: {new_task}"
+    )
+    negative_prompt = None
+
+    results: list[dict] = [{} for _ in range(len(frames))]
+
+    def process_single(args):
+        idx, frame, seed = args
+        # 画像キーを探してAPI処理
+        new_frame = {}
+        for key, value in frame.items():
+            if key in {
+                "index",
+                "episode_index",
+                "timestamp",
+                "frame_index",
+                "task_index",
+            }:
+                continue
+            if "task" in key:
+                new_frame[key] = new_task
+
+            elif key == "observation.image.hand":
+                # 左に90度回転（反時計回り）
+                # (C, H, W) -> (C, W, H)
+                roted_cwh = torch.rot90(value, k=1, dims=(1, 2))
+                # Edit Image
+                edited_cwh = client.edit_image(
+                    roted_cwh, new_task, prompt, negative_prompt, seed
+                )
+                # (C, W, H) -> (C, H, W)
+                edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
+
+                new_frame[key] = edited_chw.permute(1, 2, 0)  # CHW -> HWC
+
+            elif "observation.image" in key:
+                # CHW tensor -> API -> HWC tensor
+                edited = client.edit_image(
+                    value, new_task, prompt, negative_prompt, seed
+                )
+                new_frame[key] = edited.permute(1, 2, 0)
+            else:
+                new_frame[key] = value
+        return idx, new_frame
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(process_single, (i, frame, seed_base + i)): i
+            for i, frame in enumerate(frames)
+        }
+
+        for future in tqdm(
+            as_completed(futures), total=len(frames), desc="API Processing"
+        ):
+            idx, new_frame = future.result()
+            results[idx] = new_frame
+
+    return results
+
+
 def augment_dataset(
     src_repo_id: str,
     dst_repo_id: str,
+    api_url: str = "http://localhost:8000",
+    max_workers: int = 4,
+    use_batch: bool = True,
 ) -> None:
+    """Dataset augmentation using API."""
+    # Initialize API client
+    global _api_client
+    _api_client = QwenImageEditClient(api_url)
+    if not _api_client.health_check():
+        raise RuntimeError(f"API server not available at {api_url}")
+
     # Load src dataset
     original_ds = LeRobotDataset(src_repo_id)
 
-    # システム情報取得
-    total_gpus = 8
-    num_gpus_used = torch.cuda.device_count() or 1
-    cpu_count = psutil.cpu_count(logical=False)
-
-    # GPU使用率に応じてリソースを按分
-    gpu_ratio = num_gpus_used / total_gpus
-    available_cpus = int(cpu_count * gpu_ratio)
-
-    import pdb
-
-    pdb.set_trace()
-    # Create new dataset with same features
+    # Create new dataset
     dst_ds = LeRobotDataset.create(
         repo_id=dst_repo_id,
         fps=original_ds.meta.info["fps"],
         features=original_ds.meta.info["features"],
         robot_type=original_ds.meta.info["robot_type"],
         use_videos=True,
-        image_writer_processes=available_cpus,
-        image_writer_threads=4,
+        image_writer_processes=56,
+        image_writer_threads=2,
     )
-    start = time.time()
-    # Copy all episodes
-    meta_episodes = original_ds.meta.episodes
-    num_episodes = len(meta_episodes["dataset_from_index"])
 
-    # Add more episodes (copy of last)
-    logger.info(f"Adding copy of {num_episodes} episodes")
+    start = time.time()
+    meta_episodes = original_ds.meta.episodes
+    num_episodes = 3  # len(meta_episodes["dataset_from_index"])
+
+    logger.info(f"Adding copy of {num_episodes} episodes using API at {api_url}")
+
     for ep_idx in tqdm(range(num_episodes), desc="Augment episodes"):
         start_idx = meta_episodes["dataset_from_index"][ep_idx]
         end_idx = meta_episodes["dataset_to_index"][ep_idx]
         new_task = generate_similar_instructions(original_ds[start_idx]["task"])
 
-        # frames = []
-        # for idx in tqdm(range(start_idx, end_idx), desc="Loading"):
-        #     frame = original_ds[idx]
-        #     frames.append((idx, frame))
-
-        # results = parallel_process_frames(frames, new_task)
-
-        # for idx, new_frame in tqdm(results, desc="Adding"):
-        #     dst_ds.add_frame(new_frame)
-        for i, idx in enumerate(range(start_idx, end_idx)):
-            frame = original_ds[idx]
-            new_frame = process_frame(
-                frame,
-                task_transform=lambda x: new_task,
-                image_transform=edit_image_gaussian_noise,
+        if use_batch:
+            # バッチ処理（並列API呼び出し）
+            frames = [original_ds[idx] for idx in range(start_idx, end_idx)]
+            processed_frames = process_frames_batch_parallel(
+                frames, new_task, max_workers=max_workers, seed_base=ep_idx * 10000
             )
-            dst_ds.add_frame(new_frame)
+            for new_frame in tqdm(processed_frames, desc="Adding frames"):
+                dst_ds.add_frame(new_frame)
+        else:
+            # 逐次処理
+            image_transform = create_image_transform_with_api(new_task, seed=ep_idx)
+            for idx in tqdm(range(start_idx, end_idx), desc="Processing frames"):
+                frame = original_ds[idx]
+                new_frame = process_frame(
+                    frame,
+                    task_transform=lambda x: new_task,
+                    image_transform=image_transform,
+                )
+                dst_ds.add_frame(new_frame)
+
         dst_ds.save_episode()
 
     dst_ds.finalize()
     diff_time = time.time() - start
-    logger.info(f"total_time: {diff_time}")
+    logger.info(f"total_time: {diff_time:.2f}s")
+
     aug_ds = LeRobotDataset(dst_repo_id)
     merged = merge_datasets(
         [original_ds, aug_ds], output_repo_id=f"{dst_repo_id}_merged"
     )
     merged.finalize()
-    logger.info(f"Done! Augmeted Episodes: {num_episodes}, saved to {dst_repo_id}")
+
+    logger.info(f"Done! Augmented Episodes: {num_episodes}, saved to {dst_repo_id}")
     logger.info(
         f"Done! Merged Episodes: {num_episodes} -> {2 * num_episodes}, saved to {dst_repo_id}_merged"
     )
@@ -221,6 +367,11 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--src-repo-id", required=True)
     p.add_argument("--dst-repo-id", required=True)
+    p.add_argument("--api-url", default="http://localhost:11303", help="API server URL")
+    p.add_argument(
+        "--max-workers", type=int, default=4, help="Parallel workers for API calls"
+    )
+    p.add_argument("--use-batch", action="store_true", help="Disable batch processing")
     p.add_argument("--offline", action="store_true")
     args = p.parse_args()
 
@@ -231,7 +382,13 @@ def main():
         os.environ["HF_HOME"] = "/home/group_25b505/group_5/.cache/huggingface"
         os.environ.pop("LEROBOT_HOME", None)
 
-    augment_dataset(args.src_repo_id, args.dst_repo_id)
+    augment_dataset(
+        args.src_repo_id,
+        args.dst_repo_id,
+        api_url=args.api_url,
+        max_workers=args.max_workers,
+        use_batch=args.use_batch,
+    )
 
 
 if __name__ == "__main__":
