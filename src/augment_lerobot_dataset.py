@@ -318,12 +318,11 @@ def augment_dataset(
 
     start = time.time()
     meta_episodes = original_ds.meta.episodes
-    num_episodes = 1  # len(meta_episodes["dataset_from_index"])
+    num_episodes = len(meta_episodes["dataset_from_index"])
 
     logger.info(f"Adding copy of {num_episodes} episodes using API at {api_url}")
 
     for ep_idx in tqdm(range(num_episodes), desc="Augment episodes"):
-        ep_idx = 2
         start_idx = meta_episodes["dataset_from_index"][ep_idx]
         end_idx = meta_episodes["dataset_to_index"][ep_idx]
         new_task = generate_similar_instructions(original_ds[start_idx]["task"])
