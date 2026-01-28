@@ -16,8 +16,9 @@ conda activate /home/group_25b505/group_5/kawagoshi/synthetic_dataset/aug_datase
 set -u
 
 python src/augment_lerobot_dataset.py \
-  --src-repo-id hsr/2025-09_task05_absolute \
-  --dst-repo-id hsr/2025-09_task05_absolute_aug4 \
+  --src-repo-id hsr/2025-09_task48_absolute \
+  --dst-repo-id hsr/2025-09_task48_absolute_aug \
+  --api-url http://aic-gh2b-310034:11303 \
   --max-workers 56 \
   --offline \
   --use-batch 

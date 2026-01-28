@@ -19,11 +19,16 @@ conda create --prefix ./.aug_env python=3.10
 conda activate .aug_envの環境先
 conda install ffmpeg -c conda-forge
 pip install -r requirements.txt
-# pip install vllm==0.10.1.1
 # pip install lerobot==0.4.3
 # pip install av==15.1.0 numpy==2.2.6
 # pip install requests python-dotenv
 # pip install ruff mypy pre-commit
+```
+
+## GPT-OSSモデルの環境インストール
+```bash
+conda create --prefix ./.vllm_env python=3.12
+pip install vllm
 ```
 
 ## 画像拡張モデルの環境インストール
@@ -90,6 +95,15 @@ curl -X POST http://aic-gh2b-310033:8000/v1/chat/completions \
 ```bash
 sbatch run_augment_lerobot_dataset.sh
 ```
+以下で、疎通確認をしてください。
+```
+curl -X GET http://aic-gh2b-310034:11303/health
+```
+以下のような返答があれば、OK。
+```
+{"status":"healthy","ready":true,"num_gpus":8,"processes_alive":8}
+```
+
 
 ### 基本的な使用
 
@@ -100,9 +114,10 @@ cp .env.sample .env
 
 ```
 python src/augment_lerobot_dataset.py \
-  --src-repo-id hsr/2025-09_task05_absolute \
-  --dst-repo-id hsr/2025-09_task05_absolute_aug1 \
-  --max-workers 32 \
+  --src-repo-id hsr/2025-09_task48_absolute \
+  --dst-repo-id hsr/2025-09_task48_absolute_aug \
+  --api-url http://aic-gh2b-310034:11303 \
+  --max-workers 56 \
   --offline \
   --use-batch 
 ```

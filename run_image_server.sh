@@ -2,9 +2,8 @@
 #SBATCH --job-name=api_image_edit
 #SBATCH -p part-group_25b505 
 #SBATCH --nodes=1          
-#SBATCH --nodelist=aic-gh2b-310033
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --nodelist=aic-gh2b-310034
+#SBATCH --gpus-per-node=8
 #SBATCH --time=7-00:00:00
 #SBATCH --output=logs/image-edit_%j.out
 #SBATCH --error=logs/image-edit_%j.err
@@ -28,4 +27,4 @@ echo "Model=${MODEL}"
 echo "Port=${PORT}"
 
 # ---- ★ここが本質：foreground 実行 ----
-exec python vllm_server/qwen_sam3_server.py
+exec python vllm_server/qwen_sam3_server_multi_gpu.py
