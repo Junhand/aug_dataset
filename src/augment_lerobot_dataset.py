@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 SEGMENT_TASKS = "shelf, object, pet bottle, container, box"
-# SEGMENT_TASKS = "oven, bread, dish, table, plate"
+# SEGMENT_TASKS = "box, oven, microwave oven, object, food, dish, table, plate"
 
 
 def build_prompt(task: str) -> tuple[str, str]:
