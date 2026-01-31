@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 
 # Configuration
 MAX_QUEUE_SIZE = 1000
-REQUEST_TIMEOUT = 300
+REQUEST_TIMEOUT = 3000
 NUM_GPUS = 8
 JPEG_QUALITY = 95  # High quality JPEG for faster serialization
 

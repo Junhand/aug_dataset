@@ -2,7 +2,7 @@
 #SBATCH --job-name=aug_data
 #SBATCH -p part-group_25b505 
 #SBATCH --nodes=1          
-#SBATCH --nodelist=aic-gh2b-310033
+#SBATCH --nodelist=aic-gh2b-310034
 #SBATCH --gpus-per-node=0
 #SBATCH --cpus-per-task=112
 #SBATCH --time=7-00:00:00
@@ -17,8 +17,8 @@ set -u
 
 python src/augment_lerobot_dataset.py \
   --src-repo-id hsr/2025-09_task48_absolute \
-  --dst-repo-id hsr/2025-09_task48_absolute_aug \
-  --api-url http://aic-gh2b-310034:11303 \
+  --dst-repo-id hsr/2025-09_task48_absolute_aug9 \
+  --api-url http://aic-gh2b-310038:11303,http://aic-gh2b-310042:11303 \
   --max-workers 56 \
   --offline \
   --use-batch 
