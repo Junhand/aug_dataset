@@ -1,3 +1,8 @@
+"""
+Dataset Augmentation Client with Multi-Node API Support and TorchVision Augmentation
+- 1 frame -> 10 frames (1 Qwen edit + 9 torchvision augmentations)
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -8,7 +13,10 @@ import time
 import io
 import base64
 import itertools
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.dataset_tools import merge_datasets
@@ -16,7 +24,7 @@ from aug_instruction import generate_similar_instructions
 
 import requests
 from tqdm import tqdm
-from typing import Optional, Callable, List
+from torchvision.transforms import v2
 
 LOG_FORMAT = (
     "\n==================================================\n"
@@ -29,8 +37,11 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 
-SEGMENT_TASKS = "shelf, object, pet bottle, container, box"
-# SEGMENT_TASKS = "box, oven, microwave oven, object, food, dish, table, plate"
+SEGMENT_TASKS = "shelf, object, pet bottle, container, box"  # task05
+# SEGMENT_TASKS = "box, oven, microwave oven, object, food, dish, table, plate" #task48
+
+# Augmentation multiplier: 1 original -> N_AUGMENT frames
+N_AUGMENT = 10
 
 
 def build_prompt(task: str) -> tuple[str, str]:
@@ -40,13 +51,147 @@ def build_prompt(task: str) -> tuple[str, str]:
         "Preserve the same indoor setting, materials, scene context, objects, and overall atmosphere. "
         f"Task: {task}"
     )
-
     negative_prompt = " "
     return prompt, negative_prompt
 
 
+@dataclass
+class AugmentationConfig:
+    """Configuration for torchvision augmentations."""
+
+    # Color augmentation ranges
+    brightness_range: Tuple[float, float] = (0.7, 1.3)
+    contrast_range: Tuple[float, float] = (0.7, 1.3)
+    saturation_range: Tuple[float, float] = (0.7, 1.3)
+    hue_range: Tuple[float, float] = (-0.1, 0.1)
+
+    # Sharpness
+    sharpness_range: Tuple[float, float] = (0.5, 2.0)
+
+    # Gaussian blur
+    blur_kernel_size: int = 5
+    blur_sigma_range: Tuple[float, float] = (0.1, 2.0)
+
+    # Gaussian noise
+    noise_std_range: Tuple[float, float] = (0.01, 0.05)
+
+
+class TorchVisionAugmentor:
+    """
+    TorchVision-based image augmentation for robotics datasets.
+    Generates multiple augmented versions of a single frame.
+    """
+
+    def __init__(self, config: Optional[AugmentationConfig] = None):
+        self.config = config or AugmentationConfig()
+
+        # Define individual transforms
+        self.transforms = {
+            "color_jitter_light": v2.ColorJitter(
+                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
+            ),
+            "color_jitter_medium": v2.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
+            ),
+            "color_jitter_strong": v2.ColorJitter(
+                brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1
+            ),
+            "brightness_up": v2.ColorJitter(brightness=(1.1, 1.3)),
+            "brightness_down": v2.ColorJitter(brightness=(0.7, 0.9)),
+            "contrast_up": v2.ColorJitter(contrast=(1.1, 1.3)),
+            "contrast_down": v2.ColorJitter(contrast=(0.7, 0.9)),
+            "gaussian_blur": v2.GaussianBlur(
+                kernel_size=self.config.blur_kernel_size,
+                sigma=self.config.blur_sigma_range,
+            ),
+            "sharpness": v2.RandomAdjustSharpness(sharpness_factor=1.5, p=1.0),
+        }
+
+        # Predefined augmentation combinations for deterministic behavior
+        self.augmentation_presets = [
+            # Preset 0: Light color jitter
+            ["color_jitter_light"],
+            # Preset 1: Medium color jitter
+            ["color_jitter_medium"],
+            # Preset 2: Strong color jitter
+            ["color_jitter_strong"],
+            # Preset 3: Brightness up + slight blur
+            ["brightness_up", "gaussian_blur"],
+            # Preset 4: Brightness down + sharpness
+            ["brightness_down", "sharpness"],
+            # Preset 5: Contrast up
+            ["contrast_up"],
+            # Preset 6: Contrast down + color jitter light
+            ["contrast_down", "color_jitter_light"],
+            # Preset 7: Gaussian blur only
+            ["gaussian_blur"],
+            # Preset 8: Sharpness + color jitter light
+            ["sharpness", "color_jitter_light"],
+        ]
+
+    def add_gaussian_noise(self, tensor: torch.Tensor, std: float) -> torch.Tensor:
+        """Add Gaussian noise to tensor."""
+        noise = torch.randn_like(tensor) * std
+        return torch.clamp(tensor + noise, 0.0, 1.0)
+
+    def apply_preset(
+        self, tensor: torch.Tensor, preset_idx: int, seed: int
+    ) -> torch.Tensor:
+        """
+        Apply a specific augmentation preset to a tensor.
+
+        Args:
+            tensor: CHW tensor [0, 1]
+            preset_idx: Index of the preset (0-8 for 9 augmentations)
+            seed: Random seed for reproducibility
+
+        Returns:
+            Augmented CHW tensor [0, 1]
+        """
+        torch.manual_seed(seed)
+        random.seed(seed)
+
+        if preset_idx >= len(self.augmentation_presets):
+            # Fallback: random combination
+            preset_idx = preset_idx % len(self.augmentation_presets)
+
+        preset = self.augmentation_presets[preset_idx]
+        result = tensor.clone()
+
+        for transform_name in preset:
+            if transform_name in self.transforms:
+                result = self.transforms[transform_name](result)
+
+        # Add small noise to some presets for variety
+        if preset_idx in [1, 3, 5, 7]:
+            noise_std = random.uniform(0.01, 0.03)
+            result = self.add_gaussian_noise(result, noise_std)
+
+        return result
+
+    def generate_augmentations(
+        self, tensor: torch.Tensor, n_augment: int = 9, base_seed: int = 42
+    ) -> List[torch.Tensor]:
+        """
+        Generate multiple augmented versions of a single frame.
+
+        Args:
+            tensor: CHW tensor [0, 1]
+            n_augment: Number of augmentations to generate
+            base_seed: Base seed for reproducibility
+
+        Returns:
+            List of augmented CHW tensors [0, 1]
+        """
+        augmented = []
+        for i in range(n_augment):
+            aug_tensor = self.apply_preset(tensor, i, base_seed + i * 1000)
+            augmented.append(aug_tensor)
+        return augmented
+
+
 class QwenImageEditClient:
-    """Client for Qwen-Image-Edit API with multi-node round-robin load balancing (lock-free)."""
+    """Client for Qwen-Image-Edit API with multi-node round-robin load balancing."""
 
     def __init__(
         self,
@@ -54,15 +199,6 @@ class QwenImageEditClient:
         timeout: int = 300,
         pool_size: int = 250,
     ):
-        """
-        Args:
-            base_urls: 単一のURL文字列、またはURLのリスト
-                       例: "http://localhost:8000"
-                       例: ["http://node1:11303", "http://node2:11303", "http://node3:11303"]
-            timeout: リクエストタイムアウト（秒）
-            pool_size: 各ノードへの接続プールサイズ
-        """
-        # URLリストの正規化
         if isinstance(base_urls, str):
             self.base_urls = [base_urls.rstrip("/")]
         else:
@@ -70,11 +206,8 @@ class QwenImageEditClient:
 
         self.num_nodes = len(self.base_urls)
         self.timeout = timeout
-
-        # ロックフリーのラウンドロビン（itertools.cycleはスレッドセーフ）
         self._node_cycle = itertools.cycle(range(self.num_nodes))
 
-        # 各ノード用のセッションを作成
         self.sessions: List[requests.Session] = []
         for _ in self.base_urls:
             session = requests.Session()
@@ -91,7 +224,6 @@ class QwenImageEditClient:
         )
 
     def _get_next_node_idx(self) -> int:
-        """ロックフリーでノードインデックスを取得"""
         return next(self._node_cycle)
 
     @staticmethod
@@ -115,20 +247,7 @@ class QwenImageEditClient:
         seed: int = 42,
         node_idx: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        Edit single image.
-
-        Args:
-            image_tensor: Input CHW tensor [0,1]
-            task: Task description
-            prompt: Edit prompt
-            negative_prompt: Negative prompt
-            seed: Random seed
-            node_idx: 指定されたノードを使用（Noneの場合はラウンドロビン）
-
-        Returns:
-            Edited CHW tensor [0,1]
-        """
+        """Edit single image using Qwen API."""
         payload = {
             "image_tensor_b64": self.tensor_to_base64(image_tensor),
             "prompt": prompt,
@@ -138,7 +257,6 @@ class QwenImageEditClient:
         if negative_prompt:
             payload["negative_prompt"] = negative_prompt
 
-        # ノード選択
         if node_idx is None:
             node_idx = self._get_next_node_idx()
 
@@ -157,44 +275,8 @@ class QwenImageEditClient:
             logger.warning(f"Node {node_idx} ({base_url}) failed: {e}")
             raise
 
-    def edit_image_with_fallback(
-        self,
-        image_tensor: torch.Tensor,
-        task: str,
-        prompt: str,
-        negative_prompt: Optional[str] = None,
-        seed: int = 42,
-    ) -> torch.Tensor:
-        """
-        Edit single image with fallback to other nodes on failure.
-        """
-        start_node = self._get_next_node_idx()
-
-        for i in range(self.num_nodes):
-            node_idx = (start_node + i) % self.num_nodes
-            try:
-                return self.edit_image(
-                    image_tensor=image_tensor,
-                    task=task,
-                    prompt=prompt,
-                    negative_prompt=negative_prompt,
-                    seed=seed,
-                    node_idx=node_idx,
-                )
-            except Exception as e:
-                if i == self.num_nodes - 1:
-                    raise RuntimeError(f"All nodes failed. Last error: {e}")
-                continue
-
-        raise RuntimeError("All nodes failed")
-
     def health_check(self) -> dict:
-        """
-        Check health of all nodes.
-
-        Returns:
-            Dict with node status: {"healthy_nodes": [...], "unhealthy_nodes": [...]}
-        """
+        """Check health of all nodes."""
         healthy = []
         unhealthy = []
 
@@ -220,8 +302,9 @@ class QwenImageEditClient:
         return len(health["healthy_nodes"]) > 0
 
 
-# Global client instance
+# Global instances
 _api_client: Optional[QwenImageEditClient] = None
+_augmentor: Optional[TorchVisionAugmentor] = None
 
 
 def get_api_client(
@@ -244,127 +327,162 @@ def get_api_client(
     return _api_client
 
 
-def create_image_transform_with_api(task: str, seed: int = 42):
-    """Create image transform function with API call."""
-    prompt, negative_prompt = build_prompt(task)
-
-    def transform(frame: torch.Tensor) -> torch.Tensor:
-        client = get_api_client()
-        return client.edit_image(frame, task, prompt, negative_prompt, seed)
-
-    return transform
+def get_augmentor() -> TorchVisionAugmentor:
+    """Get or create augmentor singleton."""
+    global _augmentor
+    if _augmentor is None:
+        _augmentor = TorchVisionAugmentor()
+    return _augmentor
 
 
-def process_frame(
+def process_single_frame_with_augmentation(
     frame: dict,
-    task_transform: Optional[Callable] = None,
-    image_transform: Optional[Callable] = None,
+    task: str,
+    prompt: str,
+    negative_prompt: str,
+    seed: int,
+    node_idx: int,
+    augment_idx: int,  # 0 = Qwen edit, 1-9 = torchvision augmentation
 ) -> dict:
-    """Process frame: remove skip keys and apply transforms."""
+    """
+    Process a single frame with either Qwen edit or torchvision augmentation.
+
+    Args:
+        frame: Original frame dict
+        task: Task description
+        prompt: Qwen edit prompt
+        negative_prompt: Qwen negative prompt
+        seed: Random seed
+        node_idx: API node index for Qwen
+        augment_idx: 0 for Qwen edit, 1-9 for torchvision augmentations
+
+    Returns:
+        Processed frame dict
+    """
     SKIP_KEYS = {"index", "episode_index", "timestamp", "frame_index", "task_index"}
 
-    if task_transform is None:
-
-        def task_transform(x):
-            return x
-
-    if image_transform is None:
-
-        def image_transform(x):
-            return x.permute(1, 2, 0)
+    client = get_api_client()
+    augmentor = get_augmentor()
 
     new_frame = {}
+
     for key, value in frame.items():
         if key in SKIP_KEYS:
             continue
 
         if "task" in key:
-            value = task_transform(value)
+            new_frame[key] = task
+
         elif key == "observation.image.hand":
             roted_cwh = torch.rot90(value, k=1, dims=(1, 2))
-            edited_cwh = image_transform(roted_cwh)
-            edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
-            value = edited_chw.permute(1, 2, 0)
-        elif "observation.image" in key:
-            edited_chw = image_transform(value)
-            value = edited_chw.permute(1, 2, 0)
 
-        new_frame[key] = value
+            if augment_idx == 0:
+                # Qwen edit
+                edited_cwh = client.edit_image(
+                    roted_cwh, task, prompt, negative_prompt, seed, node_idx=node_idx
+                )
+            else:
+                # TorchVision augmentation (augment_idx 1-9 -> preset 0-8)
+                edited_cwh = augmentor.apply_preset(
+                    roted_cwh, augment_idx - 1, seed + augment_idx * 1000
+                )
+
+            edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
+            new_frame[key] = edited_chw.permute(1, 2, 0)
+
+        elif "observation.image" in key:
+            if augment_idx == 0:
+                # Qwen edit
+                edited = client.edit_image(
+                    value, task, prompt, negative_prompt, seed, node_idx=node_idx
+                )
+            else:
+                # TorchVision augmentation
+                edited = augmentor.apply_preset(
+                    value, augment_idx - 1, seed + augment_idx * 1000
+                )
+
+            new_frame[key] = edited.permute(1, 2, 0)
+        else:
+            new_frame[key] = value
+
     return new_frame
 
 
-def process_frames_batch_parallel(
+def process_frames_batch_parallel_with_augmentation(
     frames: list[dict],
     task: str,
+    n_augment: int = N_AUGMENT,
     max_workers: int = 4,
     seed_base: int = 42,
 ) -> list[dict]:
     """
-    複数フレームを並列でAPI処理する（複数ノードにラウンドロビン分散、ロックフリー）。
+    Process frames with both Qwen edits and torchvision augmentations.
+    Each input frame produces n_augment output frames.
+
+    Args:
+        frames: List of original frames
+        task: Task description
+        n_augment: Number of augmented versions per frame (default: 10)
+        max_workers: Number of parallel workers
+        seed_base: Base seed for reproducibility
+
+    Returns:
+        List of processed frames (len = len(frames) * n_augment)
     """
     client = get_api_client()
     prompt, negative_prompt = build_prompt(task)
-    results: list[dict] = [{} for _ in range(len(frames))]
 
-    # 事前にノード割り当てを決定（ロックフリー）
+    # Total output frames
+    total_output = len(frames) * n_augment
+    results: list[dict] = [{}] * total_output
+
     num_nodes = client.num_nodes
 
     def process_single(args):
-        idx, frame, seed, assigned_node = args
-        new_frame = {}
+        frame_idx, frame, augment_idx, seed, assigned_node = args
 
-        for key, value in frame.items():
-            if key in {
-                "index",
-                "episode_index",
-                "timestamp",
-                "frame_index",
-                "task_index",
-            }:
-                continue
+        new_frame = process_single_frame_with_augmentation(
+            frame=frame,
+            task=task,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            seed=seed,
+            node_idx=assigned_node,
+            augment_idx=augment_idx,
+        )
 
-            if "task" in key:
-                new_frame[key] = task
+        # Calculate output index
+        output_idx = frame_idx * n_augment + augment_idx
+        return output_idx, new_frame
 
-            elif key == "observation.image.hand":
-                roted_cwh = torch.rot90(value, k=1, dims=(1, 2))
-                # 事前に割り当てられたノードを使用
-                edited_cwh = client.edit_image(
-                    roted_cwh,
-                    task,
-                    prompt,
-                    negative_prompt,
-                    seed,
-                    node_idx=assigned_node,
-                )
-                edited_chw = torch.rot90(edited_cwh, k=3, dims=(1, 2))
-                new_frame[key] = edited_chw.permute(1, 2, 0)
+    # Create tasks: for each frame, create n_augment tasks
+    tasks = []
+    for frame_idx, frame in enumerate(frames):
+        for augment_idx in range(n_augment):
+            seed = seed_base + frame_idx * 10000 + augment_idx * 100
 
-            elif "observation.image" in key:
-                # 事前に割り当てられたノードを使用
-                edited = client.edit_image(
-                    value, task, prompt, negative_prompt, seed, node_idx=assigned_node
-                )
-                new_frame[key] = edited.permute(1, 2, 0)
+            # Only use API nodes for Qwen edits (augment_idx == 0)
+            if augment_idx == 0:
+                assigned_node = frame_idx % num_nodes
             else:
-                new_frame[key] = value
+                assigned_node = 0  # Not used for torchvision augmentation
 
-        return idx, new_frame
+            tasks.append((frame_idx, frame, augment_idx, seed, assigned_node))
 
-    # タスクを事前に作成し、ノードを均等に割り当て
-    tasks = [(i, frame, seed_base + i, i % num_nodes) for i, frame in enumerate(frames)]
-
+    # Process in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(process_single, task_args): task_args[0]
-            for task_args in tasks
+            executor.submit(process_single, task_args): task_args for task_args in tasks
         }
 
         for future in tqdm(
-            as_completed(futures), total=len(frames), desc="API Processing"
+            as_completed(futures),
+            total=len(tasks),
+            desc=f"Processing (x{n_augment} augmentation)",
         ):
-            idx, new_frame = future.result()
-            results[idx] = new_frame
+            output_idx, new_frame = future.result()
+            results[output_idx] = new_frame
 
     return results
 
@@ -373,10 +491,14 @@ def augment_dataset(
     src_repo_id: str,
     dst_repo_id: str,
     api_urls: List[str] | str = "http://localhost:8000",
+    n_augment: int = N_AUGMENT,
     max_workers: int = 4,
     use_batch: bool = True,
 ) -> None:
-    """Dataset augmentation using API with multi-node support."""
+    """
+    Dataset augmentation with Qwen edits and torchvision augmentations.
+    Each frame is expanded to n_augment frames.
+    """
     global _api_client
     _api_client = QwenImageEditClient(api_urls)
     health = _api_client.health_check()
@@ -386,6 +508,9 @@ def augment_dataset(
         )
 
     logger.info(f"Using {len(health['healthy_nodes'])} healthy node(s) for processing")
+    logger.info(f"Augmentation multiplier: 1 frame -> {n_augment} frames")
+    logger.info("  - 1 Qwen-edited frame")
+    logger.info(f"  - {n_augment - 1} torchvision-augmented frames")
 
     original_ds = LeRobotDataset(src_repo_id)
 
@@ -404,7 +529,7 @@ def augment_dataset(
     num_episodes = len(meta_episodes["dataset_from_index"])
 
     logger.info(
-        f"Adding copy of {num_episodes} episodes using {len(health['healthy_nodes'])} API node(s)"
+        f"Processing {num_episodes} episodes -> {num_episodes * n_augment} augmented episodes"
     )
 
     for ep_idx in tqdm(range(num_episodes), desc="Augment episodes"):
@@ -414,38 +539,69 @@ def augment_dataset(
 
         if use_batch:
             frames = [original_ds[idx] for idx in range(start_idx, end_idx)]
-            processed_frames = process_frames_batch_parallel(
-                frames, new_task, max_workers=max_workers, seed_base=ep_idx * 10000
-            )
-            for new_frame in tqdm(processed_frames, desc="Adding frames"):
-                dst_ds.add_frame(new_frame)
-        else:
-            image_transform = create_image_transform_with_api(new_task, seed=ep_idx)
-            for idx in tqdm(range(start_idx, end_idx), desc="Processing frames"):
-                frame = original_ds[idx]
-                new_frame = process_frame(
-                    frame,
-                    task_transform=lambda x: new_task,
-                    image_transform=image_transform,
-                )
-                dst_ds.add_frame(new_frame)
 
-        dst_ds.save_episode()
+            # Process all frames with augmentation
+            processed_frames = process_frames_batch_parallel_with_augmentation(
+                frames,
+                new_task,
+                n_augment=n_augment,
+                max_workers=max_workers,
+                seed_base=ep_idx * 100000,
+            )
+
+            # Save as n_augment separate episodes
+            for aug_idx in range(n_augment):
+                # Extract frames for this augmentation variant
+                aug_frames = [
+                    processed_frames[frame_idx * n_augment + aug_idx]
+                    for frame_idx in range(len(frames))
+                ]
+
+                for new_frame in aug_frames:
+                    dst_ds.add_frame(new_frame)
+
+                dst_ds.save_episode()
+
+        else:
+            # Non-batch mode: process frame by frame
+            for aug_idx in range(n_augment):
+                prompt, negative_prompt = build_prompt(new_task)
+
+                for idx in tqdm(
+                    range(start_idx, end_idx), desc=f"Episode {ep_idx} Aug {aug_idx}"
+                ):
+                    frame = original_ds[idx]
+                    new_frame = process_single_frame_with_augmentation(
+                        frame=frame,
+                        task=new_task,
+                        prompt=prompt,
+                        negative_prompt=negative_prompt,
+                        seed=ep_idx * 100000 + idx * 100 + aug_idx,
+                        node_idx=idx % _api_client.num_nodes,
+                        augment_idx=aug_idx,
+                    )
+                    dst_ds.add_frame(new_frame)
+
+                dst_ds.save_episode()
 
     dst_ds.finalize()
     diff_time = time.time() - start
-    logger.info(f"total_time: {diff_time:.2f}s")
+    logger.info(f"Total time: {diff_time:.2f}s")
 
+    # Merge with original dataset
     aug_ds = LeRobotDataset(dst_repo_id)
+    total_episodes = num_episodes + num_episodes * n_augment
     merged = merge_datasets(
         [original_ds, aug_ds], output_repo_id=f"{dst_repo_id}_merged"
     )
     merged.finalize()
 
-    logger.info(f"Done! Augmented Episodes: {num_episodes}, saved to {dst_repo_id}")
     logger.info(
-        f"Done! Merged Episodes: {num_episodes} -> {2 * num_episodes}, saved to {dst_repo_id}_merged"
+        f"Done! Original: {num_episodes} episodes, "
+        f"Augmented: {num_episodes * n_augment} episodes"
     )
+    logger.info(f"Saved to: {dst_repo_id}")
+    logger.info(f"Merged: {total_episodes} episodes, saved to: {dst_repo_id}_merged")
 
 
 def parse_api_urls(url_string: str) -> List[str]:
@@ -454,23 +610,30 @@ def parse_api_urls(url_string: str) -> List[str]:
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--src-repo-id", required=True)
-    p.add_argument("--dst-repo-id", required=True)
+    p = argparse.ArgumentParser(
+        description="Dataset augmentation with Qwen edits + torchvision augmentations"
+    )
+    p.add_argument("--src-repo-id", required=True, help="Source dataset repo ID")
+    p.add_argument("--dst-repo-id", required=True, help="Destination dataset repo ID")
     p.add_argument(
         "--api-urls",
         default="http://localhost:11303",
-        help="API server URL(s), comma-separated for multiple nodes. "
-        "Example: 'http://node1:11303,http://node2:11303,http://node3:11303'",
+        help="API server URL(s), comma-separated for multiple nodes",
+    )
+    p.add_argument(
+        "--n-augment",
+        type=int,
+        default=N_AUGMENT,
+        help=f"Number of augmented frames per original frame (default: {N_AUGMENT})",
     )
     p.add_argument(
         "--max-workers",
         type=int,
         default=24,
-        help="Parallel workers for API calls (recommend: 8 * num_nodes)",
+        help="Parallel workers for processing",
     )
     p.add_argument("--use-batch", action="store_true", help="Enable batch processing")
-    p.add_argument("--offline", action="store_true")
+    p.add_argument("--offline", action="store_true", help="Use offline cache paths")
     args = p.parse_args()
 
     if args.offline:
@@ -487,6 +650,7 @@ def main():
         args.src_repo_id,
         args.dst_repo_id,
         api_urls=api_urls,
+        n_augment=args.n_augment,
         max_workers=args.max_workers,
         use_batch=args.use_batch,
     )
