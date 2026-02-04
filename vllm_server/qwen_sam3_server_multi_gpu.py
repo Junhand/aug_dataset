@@ -1,10 +1,11 @@
 """
-Qwen-Image-Edit API Server with SAM3 Segmentation + TorchVision Augmentation
+Qwen-Image-Edit API Server with SAM3 Segmentation
 (8 GPU Multiprocess)
 
-Supports two types of image processing:
-1. Qwen edit with SAM3 segmentation (background modification)
-2. TorchVision augmentations (color, brightness, contrast, etc.)
+v6: Quantized model (4-bit) + Lightning LoRA from HuggingFace
+- Uses PipelineQuantizationConfig for 4-bit quantization
+- Loads LoRA from 'lightx2v/Qwen-Image-Edit-2511-Lightning'
+- /edit endpoint: 1 image in -> 1 image out
 """
 
 import io
@@ -12,18 +13,15 @@ import os
 import math
 import base64
 import asyncio
-import random
 import multiprocessing as mp
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 
 import torch
 import numpy as np
 from PIL import Image
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from torchvision.transforms import v2
 
 
 # Configuration
@@ -34,11 +32,13 @@ JPEG_QUALITY = 95
 
 # Model paths
 MODEL_NAME = "Qwen/Qwen-Image-Edit-2511"
-LORA_PATH = "/home/group_25b505/group_5/kawagoshi/synthetic_dataset/aug_dataset/Qwen-Image-Lightning/Qwen-Image-Edit-Lightning/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors"
+LORA_REPO = "lightx2v/Qwen-Image-Edit-2511-Lightning"
+LORA_WEIGHT_NAME = "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
 
 # Inference settings
 NUM_INFERENCE_STEPS = 4
 TRUE_CFG_SCALE = 1.0
+GUIDANCE_SCALE = 1.0
 
 
 def tensor_to_base64(tensor: torch.Tensor) -> str:
@@ -64,7 +64,8 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 
 def pil_to_tensor(img: Image.Image) -> torch.Tensor:
     np_img = np.array(img.convert("RGB"))
-    return torch.from_numpy(np_img).permute(2, 0, 1).float() / 255.0
+    tensor = torch.from_numpy(np_img).permute(2, 0, 1).float() / 255.0
+    return torch.clamp(tensor, 0.0, 1.0)
 
 
 def composite_images(
@@ -89,119 +90,55 @@ def composite_images(
     result = edited_np.copy()
     result[mask_np] = original_np[mask_np]
 
-    red = np.zeros_like(result)
-    red[..., 0] = 255
-    result[mask_np] = (1.0 - overlay_alpha) * result[mask_np] + overlay_alpha * red[mask_np]
+    if overlay_alpha > 0:
+        red = np.zeros_like(result)
+        red[..., 0] = 255
+        result[mask_np] = (1.0 - overlay_alpha) * result[mask_np] + overlay_alpha * red[mask_np]
 
     return Image.fromarray(np.clip(result, 0, 255).astype(np.uint8))
 
 
-@dataclass
-class AugmentationConfig:
-    """Configuration for torchvision augmentations."""
-    brightness_range: Tuple[float, float] = (0.7, 1.3)
-    contrast_range: Tuple[float, float] = (0.7, 1.3)
-    saturation_range: Tuple[float, float] = (0.7, 1.3)
-    hue_range: Tuple[float, float] = (-0.1, 0.1)
-    sharpness_range: Tuple[float, float] = (0.5, 2.0)
-    blur_kernel_size: int = 5
-    blur_sigma_range: Tuple[float, float] = (0.1, 2.0)
-    noise_std_range: Tuple[float, float] = (0.01, 0.05)
-
-
-class TorchVisionAugmentor:
-    """TorchVision-based image augmentation."""
-    
-    def __init__(self, config: Optional[AugmentationConfig] = None):
-        self.config = config or AugmentationConfig()
-        
-        self.transforms = {
-            "color_jitter_light": v2.ColorJitter(
-                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
-            ),
-            "color_jitter_medium": v2.ColorJitter(
-                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
-            ),
-            "color_jitter_strong": v2.ColorJitter(
-                brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1
-            ),
-            "brightness_up": v2.ColorJitter(brightness=(1.1, 1.3)),
-            "brightness_down": v2.ColorJitter(brightness=(0.7, 0.9)),
-            "contrast_up": v2.ColorJitter(contrast=(1.1, 1.3)),
-            "contrast_down": v2.ColorJitter(contrast=(0.7, 0.9)),
-            "gaussian_blur": v2.GaussianBlur(
-                kernel_size=self.config.blur_kernel_size,
-                sigma=self.config.blur_sigma_range
-            ),
-            "sharpness": v2.RandomAdjustSharpness(sharpness_factor=1.5, p=1.0),
-        }
-        
-        self.augmentation_presets = [
-            ["color_jitter_light"],
-            ["color_jitter_medium"],
-            ["color_jitter_strong"],
-            ["brightness_up", "gaussian_blur"],
-            ["brightness_down", "sharpness"],
-            ["contrast_up"],
-            ["contrast_down", "color_jitter_light"],
-            ["gaussian_blur"],
-            ["sharpness", "color_jitter_light"],
-        ]
-    
-    def add_gaussian_noise(self, tensor: torch.Tensor, std: float) -> torch.Tensor:
-        noise = torch.randn_like(tensor) * std
-        return torch.clamp(tensor + noise, 0.0, 1.0)
-    
-    def apply_preset(self, tensor: torch.Tensor, preset_idx: int, seed: int) -> torch.Tensor:
-        torch.manual_seed(seed)
-        random.seed(seed)
-        
-        if preset_idx >= len(self.augmentation_presets):
-            preset_idx = preset_idx % len(self.augmentation_presets)
-        
-        preset = self.augmentation_presets[preset_idx]
-        result = tensor.clone()
-        
-        for transform_name in preset:
-            if transform_name in self.transforms:
-                result = self.transforms[transform_name](result)
-        
-        if preset_idx in [1, 3, 5, 7]:
-            noise_std = random.uniform(0.01, 0.03)
-            result = self.add_gaussian_noise(result, noise_std)
-        
-        return result
-
-
-# Global augmentor instance (CPU-based, thread-safe)
-_augmentor = TorchVisionAugmentor()
-
-
-def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue, ready_event: mp.Event):
-    """Worker process for a single GPU."""
+def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue, ready_event: mp.Event, pending_jobs: mp.Array):
+    """Worker process for a single GPU with quantized model."""
     
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     
     import torch
-    from diffusers import FlowMatchEulerDiscreteScheduler, QwenImageEditPlusPipeline
-    from diffusers.models import QwenImageTransformer2DModel
+    from diffusers import QwenImageEditPlusPipeline, FlowMatchEulerDiscreteScheduler
+    from diffusers.quantizers import PipelineQuantizationConfig
+    from diffusers import BitsAndBytesConfig as DiffusersBitsAndBytesConfig
+    from transformers import BitsAndBytesConfig as TransformersBitsAndBytesConfig
     from sam3.model_builder import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
     device = "cuda:0"
 
     print(f"[Worker {gpu_id}] Using physical GPU {gpu_id}, visible as cuda:0")
-    print(f"[Worker {gpu_id}] Initializing models...")
+    print(f"[Worker {gpu_id}] Initializing models with 4-bit quantization...")
 
     try:
+        # Initialize SAM3
         sam3_model = build_sam3_image_model()
         sam3_processor = Sam3Processor(sam3_model)
 
-        torch_dtype = torch.bfloat16
-        model = QwenImageTransformer2DModel.from_pretrained(
-            MODEL_NAME, subfolder="transformer", torch_dtype=torch_dtype
+        # Quantization config for 4-bit
+        pipeline_quant_config = PipelineQuantizationConfig(
+            quant_mapping={
+                "transformer": DiffusersBitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    llm_int8_skip_modules=["transformer_blocks.0.img_mod"],
+                ),
+                "text_encoder": TransformersBitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                ),
+            }
         )
 
+        # Scheduler config
         scheduler_config = {
             "base_image_seq_len": 256,
             "base_shift": math.log(3),
@@ -220,13 +157,22 @@ def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue
         }
         scheduler = FlowMatchEulerDiscreteScheduler.from_config(scheduler_config)
 
+        # Load pipeline with quantization
         pipe = QwenImageEditPlusPipeline.from_pretrained(
             MODEL_NAME,
-            transformer=model,
+            torch_dtype=torch.bfloat16,
+            quantization_config=pipeline_quant_config,
             scheduler=scheduler,
-            torch_dtype=torch_dtype,
         )
-        pipe.load_lora_weights(LORA_PATH)
+
+        # Load LoRA weights from HuggingFace
+        pipe.load_lora_weights(
+            LORA_REPO,
+            weight_name=LORA_WEIGHT_NAME,
+            adapter_name="lightning",
+        )
+
+        # Move to GPU (quantized models handle this differently)
         pipe = pipe.to(device)
 
         print(f"[Worker {gpu_id}] Ready! Memory: {torch.cuda.memory_allocated(0) / 1024**3:.2f} GB")
@@ -278,24 +224,29 @@ def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue
                 print(f"[Worker {gpu_id}] Shutting down...")
                 break
 
-            job_id, image_bytes, original_size, prompt, negative_prompt, task, seed = job
+            job_id, image_bytes, original_size, prompt, negative_prompt, task, seed, overlay_alpha = job
 
             input_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             mask = segment_task_objects(input_pil, task)
 
             generator = torch.Generator(device=device).manual_seed(seed)
-            result = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=[input_pil],
-                generator=generator,
-                num_inference_steps=NUM_INFERENCE_STEPS,
-                true_cfg_scale=TRUE_CFG_SCALE,
-            )
+            
+            # Inference with quantized model
+            with torch.inference_mode():
+                result = pipe(
+                    image=[input_pil],
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    generator=generator,
+                    num_inference_steps=NUM_INFERENCE_STEPS,
+                    true_cfg_scale=TRUE_CFG_SCALE,
+                    guidance_scale=GUIDANCE_SCALE,
+                    num_images_per_prompt=1,
+                )
             edited_pil = result.images[0]
 
             if mask is not None:
-                output_pil = composite_images(input_pil, edited_pil, mask)
+                output_pil = composite_images(input_pil, edited_pil, mask, overlay_alpha=overlay_alpha)
             else:
                 h, w = original_size
                 if edited_pil.size != (w, h):
@@ -304,21 +255,26 @@ def gpu_worker_process(gpu_id: int, task_queue: mp.Queue, result_queue: mp.Queue
                     output_pil = edited_pil
 
             output_buffer = io.BytesIO()
-            output_pil.save(output_buffer, format="JPEG", quality=95)
+            output_pil.save(output_buffer, format="JPEG", quality=JPEG_QUALITY)
             output_bytes = output_buffer.getvalue()
 
+            # Decrement pending jobs counter
+            pending_jobs[gpu_id] -= 1
+            
             result_queue.put((job_id, output_bytes, None))
-            print(f"[Worker {gpu_id}] Job {job_id} completed (Qwen edit)")
+            print(f"[Worker {gpu_id}] Job {job_id} completed (pending: {pending_jobs[gpu_id]})")
 
         except Exception as e:
             import traceback
             print(f"[Worker {gpu_id}] Error: {e}")
             traceback.print_exc()
+            # Decrement pending jobs counter on error too
+            pending_jobs[gpu_id] -= 1
             result_queue.put((job_id, None, str(e)))
 
 
 class MultiGPUManager:
-    """Manager for GPU worker processes."""
+    """Manager for GPU worker processes with dynamic load balancing."""
 
     def __init__(self, num_gpus: int = NUM_GPUS):
         self.num_gpus = min(num_gpus, torch.cuda.device_count())
@@ -326,29 +282,36 @@ class MultiGPUManager:
         self.task_queues = []
         self.result_queue = None
         self.ready_events = []
-        self.current_gpu = 0
         self.job_futures = {}
         self.job_counter = 0
         self._lock = asyncio.Lock()
         self._result_worker_task = None
+        
+        # Track pending jobs per GPU for dynamic load balancing
+        self.pending_jobs = None  # Will be initialized in initialize()
+        self._ctx = None  # Multiprocessing context
 
     def initialize(self):
         print(f"Detected {torch.cuda.device_count()} GPUs, using {self.num_gpus}")
-        print(f"Starting {self.num_gpus} GPU worker processes...")
+        print(f"Starting {self.num_gpus} GPU worker processes with 4-bit quantization...")
 
-        ctx = mp.get_context('spawn')
-        self.result_queue = ctx.Queue()
+        # Use spawn context for everything
+        self._ctx = mp.get_context('spawn')
+        self.result_queue = self._ctx.Queue()
+        
+        # Shared array to track pending jobs per GPU (created in spawn context)
+        self.pending_jobs = self._ctx.Array('i', [0] * self.num_gpus)
 
         for gpu_id in range(self.num_gpus):
-            task_queue = ctx.Queue()
-            ready_event = ctx.Event()
+            task_queue = self._ctx.Queue()
+            ready_event = self._ctx.Event()
             
             self.task_queues.append(task_queue)
             self.ready_events.append(ready_event)
 
-            p = ctx.Process(
+            p = self._ctx.Process(
                 target=gpu_worker_process,
-                args=(gpu_id, task_queue, self.result_queue, ready_event),
+                args=(gpu_id, task_queue, self.result_queue, ready_event, self.pending_jobs),
             )
             p.start()
             self.processes.append(p)
@@ -356,10 +319,15 @@ class MultiGPUManager:
 
         print("[Main] Waiting for all workers to initialize...")
         for i, event in enumerate(self.ready_events):
-            event.wait(timeout=300)
+            event.wait(timeout=600)  # Longer timeout for quantized model loading
             print(f"[Main] Worker {i} is ready")
 
         print(f"All {self.num_gpus} worker processes are ready!")
+
+    def _get_least_loaded_gpu(self) -> int:
+        """Get GPU with fewest pending jobs (dynamic load balancing)."""
+        pending = [self.pending_jobs[i] for i in range(self.num_gpus)]
+        return pending.index(min(pending))
 
     async def start_result_worker(self):
         self._result_worker_task = asyncio.create_task(self._collect_results())
@@ -412,20 +380,22 @@ class MultiGPUManager:
                 p.terminate()
         print("[Main] All workers stopped")
 
-    async def submit_qwen_job(
+    async def submit_job(
         self,
         input_tensor: torch.Tensor,
         prompt: str,
         negative_prompt: str,
         task: str,
         seed: int,
+        overlay_alpha: float = 0.0,
     ) -> torch.Tensor:
-        """Submit a Qwen edit job to GPU workers."""
+        """Submit an edit job to the least loaded GPU worker."""
         async with self._lock:
             job_id = self.job_counter
             self.job_counter += 1
-            gpu_id = self.current_gpu
-            self.current_gpu = (self.current_gpu + 1) % self.num_gpus
+            # Dynamic load balancing: pick GPU with fewest pending jobs
+            gpu_id = self._get_least_loaded_gpu()
+            self.pending_jobs[gpu_id] += 1
 
         original_h, original_w = input_tensor.shape[1], input_tensor.shape[2]
 
@@ -438,18 +408,21 @@ class MultiGPUManager:
         future = loop.create_future()
         self.job_futures[job_id] = future
 
-        job = (job_id, image_bytes, (original_h, original_w), prompt, negative_prompt, task, seed)
+        job = (job_id, image_bytes, (original_h, original_w), prompt, negative_prompt, task, seed, overlay_alpha)
         self.task_queues[gpu_id].put(job)
-        print(f"[Main] Qwen job {job_id} submitted to Worker {gpu_id}")
+        
+        # Log with pending job counts
+        pending_str = ",".join(str(self.pending_jobs[i]) for i in range(self.num_gpus))
+        print(f"[Main] Job {job_id} -> GPU {gpu_id} (pending: [{pending_str}])")
 
         try:
             output_bytes = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
         except asyncio.TimeoutError:
             self.job_futures.pop(job_id, None)
+            self.pending_jobs[gpu_id] -= 1
             raise HTTPException(status_code=504, detail="Request timeout")
 
-        output_pil = Image.open(io.BytesIO(output_bytes)).convert("RGB")
-        return pil_to_tensor(output_pil)
+        return pil_to_tensor(Image.open(io.BytesIO(output_bytes)).convert("RGB"))
 
     @property
     def is_ready(self) -> bool:
@@ -469,8 +442,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Qwen-Image-Edit + TorchVision Augmentation API (8 GPU)",
-    version="7.0.0",
+    title="Qwen-Image-Edit API with SAM3 (8 GPU, 4-bit Quantized)",
+    description="SAM3 segmentation + Qwen-Image-Edit with 4-bit quantization and Lightning LoRA.",
+    version="6.0.0",
     lifespan=lifespan,
 )
 
@@ -480,55 +454,18 @@ app = FastAPI(
 # ============================================================
 
 class ImageEditRequest(BaseModel):
-    """Request for Qwen image editing."""
-    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor")
-    prompt: str
-    task: str = Field(..., description="Task description for SAM3 segmentation")
-    negative_prompt: Optional[str] = Field(default="")
-    seed: Optional[int] = Field(default=42)
+    """Request for Qwen image editing with SAM3 segmentation."""
+    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor [0,1]")
+    prompt: str = Field(..., description="Edit prompt")
+    task: str = Field(..., description="Task description for SAM3 segmentation (comma-separated objects)")
+    negative_prompt: Optional[str] = Field(default="", description="Negative prompt")
+    seed: Optional[int] = Field(default=42, description="Random seed")
+    overlay_alpha: Optional[float] = Field(default=0.0, ge=0.0, le=1.0, description="Overlay alpha for mask visualization (0.0 = no overlay, 1.0 = full red)")
 
 
 class ImageEditResponse(BaseModel):
     """Response for image editing."""
-    image_tensor_b64: str
-    success: bool = True
-    message: str = "OK"
-
-
-class AugmentRequest(BaseModel):
-    """Request for torchvision augmentation."""
-    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor")
-    preset_idx: int = Field(..., ge=0, le=8, description="Augmentation preset index (0-8)")
-    seed: Optional[int] = Field(default=42)
-
-
-class BatchAugmentRequest(BaseModel):
-    """Request for batch torchvision augmentation (1 image -> N augmentations)."""
-    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor")
-    n_augment: int = Field(default=9, ge=1, le=20, description="Number of augmentations")
-    seed: Optional[int] = Field(default=42)
-
-
-class BatchAugmentResponse(BaseModel):
-    """Response for batch augmentation."""
-    image_tensors_b64: List[str] = Field(..., description="List of augmented tensors")
-    success: bool = True
-    message: str = "OK"
-
-
-class CombinedEditRequest(BaseModel):
-    """Request for combined Qwen edit + torchvision augmentations."""
-    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor")
-    prompt: str
-    task: str = Field(..., description="Task description for SAM3 segmentation")
-    negative_prompt: Optional[str] = Field(default="")
-    n_augment: int = Field(default=10, ge=1, le=20, description="Total output frames (1 Qwen + N-1 augment)")
-    seed: Optional[int] = Field(default=42)
-
-
-class CombinedEditResponse(BaseModel):
-    """Response for combined edit."""
-    image_tensors_b64: List[str] = Field(..., description="List of processed tensors [Qwen, Aug1, Aug2, ...]")
+    image_tensor_b64: str = Field(..., description="Base64 encoded CHW tensor [0,1]")
     success: bool = True
     message: str = "OK"
 
@@ -539,110 +476,27 @@ class CombinedEditResponse(BaseModel):
 
 @app.post("/edit", response_model=ImageEditResponse)
 async def edit_image(request: ImageEditRequest):
-    """Qwen image editing with SAM3 segmentation."""
+    """
+    Edit image using SAM3 segmentation + Qwen-Image-Edit (4-bit quantized).
+    
+    - SAM3 segments robot and task objects to create a mask
+    - Qwen edits the background while preserving masked regions
+    - Returns 1 edited image
+    """
     try:
         input_tensor = base64_to_tensor(request.image_tensor_b64)
 
-        output_tensor = await manager.submit_qwen_job(
+        output_tensor = await manager.submit_job(
             input_tensor=input_tensor,
             prompt=request.prompt,
             negative_prompt=request.negative_prompt or "",
             task=request.task,
             seed=request.seed or 42,
+            overlay_alpha=request.overlay_alpha or 0.0,
         )
 
         return ImageEditResponse(
             image_tensor_b64=tensor_to_base64(output_tensor),
-            success=True,
-            message="OK",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/augment", response_model=ImageEditResponse)
-async def augment_image(request: AugmentRequest):
-    """Apply single torchvision augmentation preset."""
-    try:
-        input_tensor = base64_to_tensor(request.image_tensor_b64)
-        
-        # Run augmentation (CPU-based, fast)
-        output_tensor = _augmentor.apply_preset(
-            input_tensor, 
-            request.preset_idx, 
-            request.seed or 42
-        )
-
-        return ImageEditResponse(
-            image_tensor_b64=tensor_to_base64(output_tensor),
-            success=True,
-            message="OK",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/augment_batch", response_model=BatchAugmentResponse)
-async def augment_batch(request: BatchAugmentRequest):
-    """Generate multiple torchvision augmentations from single image."""
-    try:
-        input_tensor = base64_to_tensor(request.image_tensor_b64)
-        seed = request.seed or 42
-        
-        output_tensors = []
-        for i in range(request.n_augment):
-            aug_tensor = _augmentor.apply_preset(
-                input_tensor,
-                i % 9,  # 9 presets available
-                seed + i * 1000
-            )
-            output_tensors.append(tensor_to_base64(aug_tensor))
-
-        return BatchAugmentResponse(
-            image_tensors_b64=output_tensors,
-            success=True,
-            message="OK",
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/edit_combined", response_model=CombinedEditResponse)
-async def edit_combined(request: CombinedEditRequest):
-    """
-    Combined processing: 1 Qwen edit + (N-1) torchvision augmentations.
-    
-    Returns N images:
-    - Index 0: Qwen-edited image
-    - Index 1 to N-1: TorchVision augmented images
-    """
-    try:
-        input_tensor = base64_to_tensor(request.image_tensor_b64)
-        seed = request.seed or 42
-        
-        output_tensors = []
-        
-        # 1. Qwen edit (GPU-based)
-        qwen_output = await manager.submit_qwen_job(
-            input_tensor=input_tensor,
-            prompt=request.prompt,
-            negative_prompt=request.negative_prompt or "",
-            task=request.task,
-            seed=seed,
-        )
-        output_tensors.append(tensor_to_base64(qwen_output))
-        
-        # 2. TorchVision augmentations (CPU-based)
-        for i in range(1, request.n_augment):
-            aug_tensor = _augmentor.apply_preset(
-                input_tensor,
-                (i - 1) % 9,  # preset 0-8
-                seed + i * 1000
-            )
-            output_tensors.append(tensor_to_base64(aug_tensor))
-
-        return CombinedEditResponse(
-            image_tensors_b64=output_tensors,
             success=True,
             message="OK",
         )
@@ -653,24 +507,17 @@ async def edit_combined(request: CombinedEditRequest):
 @app.get("/health")
 async def health():
     """Health check endpoint."""
+    pending = [manager.pending_jobs[i] for i in range(manager.num_gpus)] if manager.pending_jobs else []
     return {
         "status": "healthy",
         "ready": manager.is_ready,
         "num_gpus": manager.num_gpus,
         "processes_alive": sum(1 for p in manager.processes if p.is_alive()),
-        "augmentation_presets": len(_augmentor.augmentation_presets),
-    }
-
-
-@app.get("/presets")
-async def list_presets():
-    """List available augmentation presets."""
-    return {
-        "presets": [
-            {"index": i, "transforms": preset}
-            for i, preset in enumerate(_augmentor.augmentation_presets)
-        ],
-        "total": len(_augmentor.augmentation_presets),
+        "pending_jobs_per_gpu": pending,
+        "total_pending_jobs": sum(pending),
+        "quantization": "4-bit (nf4)",
+        "lora": LORA_WEIGHT_NAME,
+        "load_balancing": "dynamic (least loaded)",
     }
 
 
