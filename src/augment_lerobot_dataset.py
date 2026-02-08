@@ -1,8 +1,8 @@
 """
 Dataset Augmentation Client with Multi-Node API Support
 - Server: SAM3 + Qwen-Image-Edit only (1 frame -> 1 frame)
-- Client: TorchVision augmentations (1 frame -> 49 frames)
-- Total: 1 frame -> 50 frames
+- Client: TorchVision augmentations (1 frame -> 19 frames)
+- Total: 1 frame -> 20 frames
 - v8: Memory-efficient processing (aug_idx by aug_idx)
 """
 
@@ -19,6 +19,7 @@ import itertools
 import random
 import gc
 import psutil
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -30,6 +31,7 @@ from aug_instruction import generate_similar_instructions
 import requests
 from tqdm import tqdm
 from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F
 
 
 def get_memory_usage_mb() -> float:
@@ -68,7 +70,7 @@ def build_prompt(task: str) -> tuple[str, str]:
 
 
 # =============================================================================
-# TorchVision Augmentor (Client-side)
+# TorchVision Augmentor (Client-side) — 19 Maximally Diverse Presets
 # =============================================================================
 
 
@@ -86,8 +88,13 @@ class AugmentationConfig:
 
 class TorchVisionAugmentor:
     """
-    TorchVision-based image augmentation for robotics datasets.
-    Provides 49 augmentation presets.
+    TorchVision-based image augmentation with 19 maximally diverse presets.
+
+    Design principles:
+      - Each preset produces a visually distinct result from all others.
+      - Robotics-safe: no horizontal flip, no large geometric distortion
+        (preserves spatial relationships needed for policy learning).
+      - Covers different perceptual axes: tone, color, texture, style, geometry, occlusion.
     """
 
     def __init__(self, config: Optional[AugmentationConfig] = None):
@@ -98,97 +105,168 @@ class TorchVisionAugmentor:
     def _build_transforms(self):
         """Build individual transform functions."""
         self.transforms = {
-            # === Color Jitter Variants ===
-            "color_jitter_very_light": v2.ColorJitter(
-                brightness=0.05, contrast=0.05, saturation=0.05, hue=0.01
-            ),
-            "color_jitter_light": v2.ColorJitter(
-                brightness=0.1, contrast=0.1, saturation=0.1, hue=0.02
-            ),
-            "color_jitter_medium": v2.ColorJitter(
-                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05
-            ),
+            # === Color / Tone ===
             "color_jitter_strong": v2.ColorJitter(
-                brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1
+                brightness=0.35, contrast=0.35, saturation=0.35, hue=0.12
             ),
-            "color_jitter_very_strong": v2.ColorJitter(
-                brightness=0.4, contrast=0.4, saturation=0.4, hue=0.15
-            ),
-            # === Brightness Variants ===
-            "brightness_up_slight": v2.ColorJitter(brightness=(1.05, 1.15)),
-            "brightness_up_medium": v2.ColorJitter(brightness=(1.15, 1.3)),
-            "brightness_up_strong": v2.ColorJitter(brightness=(1.3, 1.5)),
-            "brightness_down_slight": v2.ColorJitter(brightness=(0.85, 0.95)),
-            "brightness_down_medium": v2.ColorJitter(brightness=(0.7, 0.85)),
-            "brightness_down_strong": v2.ColorJitter(brightness=(0.5, 0.7)),
-            # === Contrast Variants ===
-            "contrast_up_slight": v2.ColorJitter(contrast=(1.05, 1.15)),
-            "contrast_up_medium": v2.ColorJitter(contrast=(1.15, 1.3)),
-            "contrast_up_strong": v2.ColorJitter(contrast=(1.3, 1.5)),
-            "contrast_down_slight": v2.ColorJitter(contrast=(0.85, 0.95)),
-            "contrast_down_medium": v2.ColorJitter(contrast=(0.7, 0.85)),
-            "contrast_down_strong": v2.ColorJitter(contrast=(0.5, 0.7)),
-            # === Saturation Variants ===
-            "saturation_up_slight": v2.ColorJitter(saturation=(1.1, 1.2)),
-            "saturation_up_medium": v2.ColorJitter(saturation=(1.2, 1.4)),
-            "saturation_up_strong": v2.ColorJitter(saturation=(1.4, 1.6)),
-            "saturation_down_slight": v2.ColorJitter(saturation=(0.8, 0.9)),
-            "saturation_down_medium": v2.ColorJitter(saturation=(0.6, 0.8)),
-            "saturation_down_strong": v2.ColorJitter(saturation=(0.3, 0.6)),
-            "grayscale_partial": v2.ColorJitter(saturation=(0.0, 0.3)),
-            # === Hue Variants ===
-            "hue_shift_slight_pos": v2.ColorJitter(hue=(0.02, 0.05)),
-            "hue_shift_medium_pos": v2.ColorJitter(hue=(0.05, 0.1)),
-            "hue_shift_slight_neg": v2.ColorJitter(hue=(-0.05, -0.02)),
-            "hue_shift_medium_neg": v2.ColorJitter(hue=(-0.1, -0.05)),
-            # === Gaussian Blur Variants ===
-            "gaussian_blur_light": v2.GaussianBlur(kernel_size=3, sigma=(0.1, 0.3)),
-            "gaussian_blur_medium": v2.GaussianBlur(kernel_size=5, sigma=(0.3, 0.7)),
-            "gaussian_blur_strong": v2.GaussianBlur(kernel_size=7, sigma=(0.7, 1.2)),
-            # === Sharpness Variants ===
-            "sharpness_up_slight": v2.RandomAdjustSharpness(
-                sharpness_factor=1.3, p=1.0
-            ),
-            "sharpness_up_medium": v2.RandomAdjustSharpness(
-                sharpness_factor=1.7, p=1.0
-            ),
+            "brightness_up_strong": v2.ColorJitter(brightness=(1.35, 1.55)),
+            "brightness_down_strong": v2.ColorJitter(brightness=(0.45, 0.65)),
+            "contrast_up_strong": v2.ColorJitter(contrast=(1.4, 1.7)),
+            "contrast_down_strong": v2.ColorJitter(contrast=(0.4, 0.6)),
+            "saturation_up_strong": v2.ColorJitter(saturation=(1.5, 1.8)),
+            "near_grayscale": v2.ColorJitter(saturation=(0.0, 0.15)),
+            "hue_shift_warm": v2.ColorJitter(hue=(0.06, 0.12)),
+            "hue_shift_cool": v2.ColorJitter(hue=(-0.12, -0.06)),
+            # === Blur / Sharpness ===
+            "gaussian_blur_strong": v2.GaussianBlur(kernel_size=9, sigma=(1.0, 2.0)),
             "sharpness_up_strong": v2.RandomAdjustSharpness(
-                sharpness_factor=2.2, p=1.0
+                sharpness_factor=2.5, p=1.0
             ),
-            "sharpness_down": v2.RandomAdjustSharpness(sharpness_factor=0.5, p=1.0),
-            # === Autocontrast ===
+            # === Style / Tone-mapping ===
             "autocontrast": v2.RandomAutocontrast(p=1.0),
+            "equalize": v2.RandomEqualize(p=1.0),
+            "posterize_4bit": v2.RandomPosterize(bits=4, p=1.0),
+            "posterize_3bit": v2.RandomPosterize(bits=3, p=1.0),
+            "solarize": v2.RandomSolarize(threshold=0.7, p=1.0),
+            # === Geometric (mild, robotics-safe) ===
+            "perspective_mild": v2.RandomPerspective(distortion_scale=0.15, p=1.0),
+            "affine_mild": v2.RandomAffine(
+                degrees=5, translate=(0.05, 0.05), scale=(0.92, 1.08)
+            ),
+            "elastic_mild": v2.ElasticTransform(alpha=30.0, sigma=4.0),
+            # === Erasing / Occlusion ===
+            "random_erasing": v2.RandomErasing(
+                p=1.0, scale=(0.02, 0.12), ratio=(0.3, 3.3), value=0
+            ),
         }
 
     def _build_presets(self):
-        """Build 19 augmentation presets (aug_idx 1-19, with aug_idx 0 being Qwen edit)."""
-        self.augmentation_presets = [
-            # === Single Transform Presets (aug_idx 1-10) ===
-            ["color_jitter_light"],  # 0 -> aug_idx 1
-            ["color_jitter_medium"],  # 1 -> aug_idx 2
-            ["brightness_up_medium"],  # 2 -> aug_idx 3
-            ["brightness_down_medium"],  # 3 -> aug_idx 4
-            ["contrast_up_medium"],  # 4 -> aug_idx 5
-            ["contrast_down_medium"],  # 5 -> aug_idx 6
-            ["saturation_up_medium"],  # 6 -> aug_idx 7
-            ["saturation_down_medium"],  # 7 -> aug_idx 8
-            ["gaussian_blur_light"],  # 8 -> aug_idx 9
-            ["gaussian_blur_medium"],  # 9 -> aug_idx 10
-            # === Single Transform Presets (aug_idx 11-14) ===
-            ["sharpness_up_medium"],  # 10 -> aug_idx 11
-            ["sharpness_down"],  # 11 -> aug_idx 12
-            ["autocontrast"],  # 12 -> aug_idx 13
-            ["grayscale_partial"],  # 13 -> aug_idx 14
-            # === Combination Presets (aug_idx 15-19) ===
-            ["brightness_up_slight", "color_jitter_light"],  # 14 -> aug_idx 15
-            ["brightness_down_slight", "contrast_down_slight"],  # 15 -> aug_idx 16
-            ["contrast_up_slight", "saturation_up_medium"],  # 16 -> aug_idx 17
-            ["gaussian_blur_light", "color_jitter_light"],  # 17 -> aug_idx 18
-            ["sharpness_up_slight", "brightness_up_slight"],  # 18 -> aug_idx 19
-        ]
+        """
+        19 maximally diverse presets (aug_idx 1–19, with aug_idx 0 being Qwen edit).
 
-        # Presets that should have noise added (odd indices)
-        self.noise_presets = {1, 3, 5, 7, 9, 11, 13, 15, 17}
+        Perceptual axes covered:
+          0-3   : Global tone / brightness
+          4-6   : Color shifts (warm, cool, desaturated)
+          7-8   : Texture (blur, sharp)
+          9-12  : Style (posterize, solarize, equalize)
+          13-15 : Geometry (perspective, affine, elastic)
+          16-18 : Cross-axis combinations
+        """
+        self.augmentation_presets = [
+            # --- Global tone / brightness (0-3) ---
+            # 0 (aug_idx 1): Overexposed look
+            {
+                "transforms": ["brightness_up_strong", "contrast_down_strong"],
+                "noise": False,
+            },
+            # 1 (aug_idx 2): Underexposed / dark scene
+            {
+                "transforms": ["brightness_down_strong", "contrast_up_strong"],
+                "noise": True,
+                "noise_std": (0.02, 0.06),
+            },
+            # 2 (aug_idx 3): High dynamic range feel
+            {
+                "transforms": ["contrast_up_strong", "saturation_up_strong"],
+                "noise": False,
+            },
+            # 3 (aug_idx 4): Flat / washed out
+            {
+                "transforms": ["contrast_down_strong", "near_grayscale"],
+                "noise": False,
+            },
+            # --- Color shifts (4-6) ---
+            # 4 (aug_idx 5): Warm tone shift (yellowish/reddish)
+            {
+                "transforms": ["hue_shift_warm", "saturation_up_strong"],
+                "noise": False,
+            },
+            # 5 (aug_idx 6): Cool tone shift (bluish)
+            {
+                "transforms": ["hue_shift_cool", "brightness_down_strong"],
+                "noise": False,
+            },
+            # 6 (aug_idx 7): Near grayscale + noise (security camera look)
+            {
+                "transforms": ["near_grayscale"],
+                "noise": True,
+                "noise_std": (0.04, 0.08),
+            },
+            # --- Texture (7-8) ---
+            # 7 (aug_idx 8): Strong blur (simulates defocus / motion)
+            {
+                "transforms": ["gaussian_blur_strong"],
+                "noise": False,
+            },
+            # 8 (aug_idx 9): Over-sharpened + noise (low-quality sensor look)
+            {
+                "transforms": ["sharpness_up_strong"],
+                "noise": True,
+                "noise_std": (0.03, 0.06),
+            },
+            # --- Style / Tone-mapping (9-12) ---
+            # 9 (aug_idx 10): Posterized (reduced color depth)
+            {
+                "transforms": ["posterize_4bit"],
+                "noise": False,
+            },
+            # 10 (aug_idx 11): Heavy posterize + vivid (cartoon-like)
+            {
+                "transforms": ["posterize_3bit", "saturation_up_strong"],
+                "noise": False,
+            },
+            # 11 (aug_idx 12): Solarized (partial inversion)
+            {
+                "transforms": ["solarize"],
+                "noise": False,
+            },
+            # 12 (aug_idx 13): Histogram equalized (enhanced local contrast)
+            {
+                "transforms": ["equalize"],
+                "noise": False,
+            },
+            # --- Geometry (13-15) ---
+            # 13 (aug_idx 14): Mild perspective warp
+            {
+                "transforms": ["perspective_mild"],
+                "noise": False,
+            },
+            # 14 (aug_idx 15): Mild affine (slight rotation + translate + scale)
+            {
+                "transforms": ["affine_mild"],
+                "noise": False,
+            },
+            # 15 (aug_idx 16): Elastic deformation (organic distortion)
+            {
+                "transforms": ["elastic_mild"],
+                "noise": False,
+            },
+            # --- Cross-axis combinations (16-18) ---
+            # 16 (aug_idx 17): Surveillance camera (blur + dark + desat + heavy noise)
+            {
+                "transforms": [
+                    "gaussian_blur_strong",
+                    "brightness_down_strong",
+                    "near_grayscale",
+                ],
+                "noise": True,
+                "noise_std": (0.05, 0.10),
+            },
+            # 17 (aug_idx 18): Vivid action-cam (jitter + perspective + sharp)
+            {
+                "transforms": [
+                    "color_jitter_strong",
+                    "perspective_mild",
+                    "sharpness_up_strong",
+                ],
+                "noise": False,
+            },
+            # 18 (aug_idx 19): Occlusion robustness (autocontrast + random erasing)
+            {
+                "transforms": ["autocontrast", "random_erasing"],
+                "noise": False,
+            },
+        ]
 
     def add_gaussian_noise(self, tensor: torch.Tensor, std: float) -> torch.Tensor:
         """Add Gaussian noise to tensor."""
@@ -206,16 +284,27 @@ class TorchVisionAugmentor:
         preset = self.augmentation_presets[preset_idx]
         result = tensor.clone()
 
-        for transform_name in preset:
-            if transform_name in self.transforms:
-                try:
-                    result = self.transforms[transform_name](result)
-                except Exception as e:
-                    logger.warning(f"Transform {transform_name} failed: {e}")
-                    continue
+        # Remember original spatial dims for geometric transform safety
+        orig_h, orig_w = result.shape[-2], result.shape[-1]
 
-        if preset_idx in self.noise_presets:
-            noise_std = random.uniform(0.01, 0.04)
+        for transform_name in preset["transforms"]:
+            transform = self.transforms.get(transform_name)
+            if transform is None:
+                continue
+            try:
+                result = transform(result)
+            except Exception as e:
+                logger.warning(f"Transform {transform_name} failed: {e}")
+                continue
+
+        # Ensure geometric transforms don't change spatial dimensions
+        if result.shape[-2] != orig_h or result.shape[-1] != orig_w:
+            result = F.resize(result, [orig_h, orig_w], antialias=True)
+
+        # Add noise if specified
+        if preset.get("noise", False):
+            noise_range = preset.get("noise_std", (0.01, 0.04))
+            noise_std = random.uniform(*noise_range)
             result = self.add_gaussian_noise(result, noise_std)
 
         # Clamp to [0.0, 1.0] to avoid floating point precision issues
@@ -663,13 +752,24 @@ def augment_dataset(
             # Open in append mode
             dst_ds = existing_ds
             dst_ds.start_image_writer(
-                num_processes=56,
+                num_processes=32,
                 num_threads=2,
             )
         except Exception as e:
             logger.info(f"No existing dataset found or error loading: {e}")
             logger.info("Starting from scratch...")
             resume = False
+
+            dst_path = os.path.join(
+                os.environ.get(
+                    "HF_LEROBOT_HOME",
+                    os.path.expanduser("~/.cache/huggingface/lerobot/lerobot"),
+                ),
+                dst_repo_id,
+            )
+            if os.path.exists(dst_path):
+                logger.warning(f"Removing incomplete dataset directory: {dst_path}")
+                shutil.rmtree(dst_path)
 
     if dst_ds is None:
         dst_ds = LeRobotDataset.create(
@@ -678,7 +778,7 @@ def augment_dataset(
             features=original_ds.meta.info["features"],
             robot_type=original_ds.meta.info["robot_type"],
             use_videos=True,
-            image_writer_processes=16,
+            image_writer_processes=32,
             image_writer_threads=2,
         )
 
@@ -743,7 +843,7 @@ def augment_dataset(
             dst_ds = LeRobotDataset(dst_repo_id)
             # Re-enable write mode
             dst_ds.start_image_writer(
-                num_processes=56,
+                num_processes=32,
                 num_threads=2,
             )
 
