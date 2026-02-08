@@ -17,9 +17,11 @@ import io
 import base64
 import itertools
 import random
+import ctypes
 import gc
 import psutil
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -38,6 +40,15 @@ def get_memory_usage_mb() -> float:
     """Get current process memory usage in MB."""
     process = psutil.Process()
     return process.memory_info().rss / (1024 * 1024)
+
+
+def force_memory_release() -> None:
+    """GC + force glibc to return free memory to OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 LOG_FORMAT = (
@@ -154,95 +165,78 @@ class TorchVisionAugmentor:
         """
         self.augmentation_presets = [
             # --- Global tone / brightness (0-3) ---
-            # 0 (aug_idx 1): Overexposed look
             {
                 "transforms": ["brightness_up_strong", "contrast_down_strong"],
                 "noise": False,
             },
-            # 1 (aug_idx 2): Underexposed / dark scene
             {
                 "transforms": ["brightness_down_strong", "contrast_up_strong"],
                 "noise": True,
                 "noise_std": (0.02, 0.06),
             },
-            # 2 (aug_idx 3): High dynamic range feel
             {
                 "transforms": ["contrast_up_strong", "saturation_up_strong"],
                 "noise": False,
             },
-            # 3 (aug_idx 4): Flat / washed out
             {
                 "transforms": ["contrast_down_strong", "near_grayscale"],
                 "noise": False,
             },
             # --- Color shifts (4-6) ---
-            # 4 (aug_idx 5): Warm tone shift (yellowish/reddish)
             {
                 "transforms": ["hue_shift_warm", "saturation_up_strong"],
                 "noise": False,
             },
-            # 5 (aug_idx 6): Cool tone shift (bluish)
             {
                 "transforms": ["hue_shift_cool", "brightness_down_strong"],
                 "noise": False,
             },
-            # 6 (aug_idx 7): Near grayscale + noise (security camera look)
             {
                 "transforms": ["near_grayscale"],
                 "noise": True,
                 "noise_std": (0.04, 0.08),
             },
             # --- Texture (7-8) ---
-            # 7 (aug_idx 8): Strong blur (simulates defocus / motion)
             {
                 "transforms": ["gaussian_blur_strong"],
                 "noise": False,
             },
-            # 8 (aug_idx 9): Over-sharpened + noise (low-quality sensor look)
             {
                 "transforms": ["sharpness_up_strong"],
                 "noise": True,
                 "noise_std": (0.03, 0.06),
             },
             # --- Style / Tone-mapping (9-12) ---
-            # 9 (aug_idx 10): Posterized (reduced color depth)
             {
                 "transforms": ["posterize_4bit"],
                 "noise": False,
             },
-            # 10 (aug_idx 11): Heavy posterize + vivid (cartoon-like)
             {
                 "transforms": ["posterize_3bit", "saturation_up_strong"],
                 "noise": False,
             },
-            # 11 (aug_idx 12): Solarized (partial inversion)
             {
                 "transforms": ["solarize"],
                 "noise": False,
             },
-            # 12 (aug_idx 13): Histogram equalized (enhanced local contrast)
             {
                 "transforms": ["equalize"],
                 "noise": False,
             },
             # --- Geometry (13-15) ---
-            # 13 (aug_idx 14): Mild perspective warp
             {
                 "transforms": ["perspective_mild"],
                 "noise": False,
             },
-            # 14 (aug_idx 15): Mild affine (slight rotation + translate + scale)
             {
                 "transforms": ["affine_mild"],
                 "noise": False,
             },
-            # 15 (aug_idx 16): Elastic deformation (organic distortion)
             {
                 "transforms": ["elastic_mild"],
                 "noise": False,
             },
             # --- Cross-axis combinations (16-18) ---
-            # 16 (aug_idx 17): Surveillance camera (blur + dark + desat + heavy noise)
             {
                 "transforms": [
                     "gaussian_blur_strong",
@@ -252,7 +246,6 @@ class TorchVisionAugmentor:
                 "noise": True,
                 "noise_std": (0.05, 0.10),
             },
-            # 17 (aug_idx 18): Vivid action-cam (jitter + perspective + sharp)
             {
                 "transforms": [
                     "color_jitter_strong",
@@ -261,7 +254,6 @@ class TorchVisionAugmentor:
                 ],
                 "noise": False,
             },
-            # 18 (aug_idx 19): Occlusion robustness (autocontrast + random erasing)
             {
                 "transforms": ["autocontrast", "random_erasing"],
                 "noise": False,
@@ -284,7 +276,6 @@ class TorchVisionAugmentor:
         preset = self.augmentation_presets[preset_idx]
         result = tensor.clone()
 
-        # Remember original spatial dims for geometric transform safety
         orig_h, orig_w = result.shape[-2], result.shape[-1]
 
         for transform_name in preset["transforms"]:
@@ -297,19 +288,15 @@ class TorchVisionAugmentor:
                 logger.warning(f"Transform {transform_name} failed: {e}")
                 continue
 
-        # Ensure geometric transforms don't change spatial dimensions
         if result.shape[-2] != orig_h or result.shape[-1] != orig_w:
             result = F.resize(result, [orig_h, orig_w], antialias=True)
 
-        # Add noise if specified
         if preset.get("noise", False):
             noise_range = preset.get("noise_std", (0.01, 0.04))
             noise_std = random.uniform(*noise_range)
             result = self.add_gaussian_noise(result, noise_std)
 
-        # Clamp to [0.0, 1.0] to avoid floating point precision issues
         result = torch.clamp(result, 0.0, 1.0)
-
         return result
 
     @property
@@ -469,7 +456,7 @@ def get_augmentor() -> TorchVisionAugmentor:
 
 
 # =============================================================================
-# Frame Processing (Memory-Efficient: One aug_idx at a time)
+# Frame Processing
 # =============================================================================
 
 SKIP_KEYS = {"index", "episode_index", "timestamp", "frame_index", "task_index"}
@@ -553,137 +540,113 @@ def process_single_frame_single_aug(
     return new_frame
 
 
-def process_episode_for_single_aug(
-    frames: List[dict],
-    task: str,
-    aug_idx: int,
-    seed_base: int,
-    max_workers: int,
-    overlay_alpha: float = 0.0,
-) -> List[Optional[dict]]:
-    """
-    Process all frames of an episode for a single aug_idx in parallel.
-    Returns: List of processed frames for this aug_idx only.
-    """
-    client = get_api_client()
-    prompt, negative_prompt = build_prompt(task)
-    num_nodes = client.num_nodes
-
-    num_frames = len(frames)
-    results: List[Optional[dict]] = [None] * num_frames
-
-    def process_single(args):
-        frame_idx, frame, seed, assigned_node = args
-        new_frame = process_single_frame_single_aug(
-            frame=frame,
-            task=task,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            aug_idx=aug_idx,
-            seed=seed,
-            node_idx=assigned_node,
-            overlay_alpha=overlay_alpha,
-        )
-        return frame_idx, new_frame
-
-    tasks = [
-        (frame_idx, frame, seed_base + frame_idx * 100000, frame_idx % num_nodes)
-        for frame_idx, frame in enumerate(frames)
-    ]
-
-    # Use more workers for TorchVision (CPU-only) vs Qwen (GPU)
-    actual_workers = (
-        min(max_workers, num_frames)
-        if aug_idx == 0
-        else min(max_workers * 2, num_frames, 64)
-    )
-
-    with ThreadPoolExecutor(max_workers=actual_workers) as executor:
-        futures = {executor.submit(process_single, t): t for t in tasks}
-
-        for future in as_completed(futures):
-            frame_idx, new_frame = future.result()
-            results[frame_idx] = new_frame
-
-    return results
+# =============================================================================
+# Sequential aug processing (Fix #4: process one aug_idx at a time)
+# =============================================================================
 
 
-def process_episode_all_augs_parallel(
+def process_episode_all_augs_sequential_save(
     frames: List[dict],
     task: str,
     n_augment: int,
     seed_base: int,
     max_workers: int,
+    dst_ds,
     overlay_alpha: float = 0.0,
-) -> List[List[Optional[dict]]]:
+) -> None:
     """
-    Process all frames for all aug_idx in parallel (frame-level parallelism).
+    Process all frames for all aug_idx and save directly to dataset.
 
-    Returns: results[aug_idx] = List of processed frames
-
-    Strategy:
-    - aug_idx=0 (Qwen): Process all frames in parallel with API calls
-    - aug_idx=1-19 (TorchVision): Process all frames in parallel on CPU
+    Memory-efficient: processes one aug_idx at a time, saves immediately,
+    then releases memory before moving to the next aug_idx.
     """
     client = get_api_client()
     prompt, negative_prompt = build_prompt(task)
     num_nodes = client.num_nodes
     num_frames = len(frames)
 
-    # Results: [aug_idx][frame_idx] = processed frame
-    all_results: List[List[Optional[dict]]] = [
-        [None] * num_frames for _ in range(n_augment)
-    ]
+    for aug_idx in range(n_augment):
+        aug_results: List[Optional[dict]] = [None] * num_frames
 
-    def process_frame_aug(args):
-        frame_idx, frame, aug_idx, seed, node_idx = args
-        new_frame = process_single_frame_single_aug(
-            frame=frame,
-            task=task,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            aug_idx=aug_idx,
-            seed=seed,
-            node_idx=node_idx,
-            overlay_alpha=overlay_alpha,
-        )
-        return frame_idx, aug_idx, new_frame
+        def process_frame(args):
+            frame_idx, frame, seed, node_idx = args
+            return frame_idx, process_single_frame_single_aug(
+                frame=frame,
+                task=task,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                aug_idx=aug_idx,
+                seed=seed,
+                node_idx=node_idx,
+                overlay_alpha=overlay_alpha,
+            )
 
-    # Process aug_idx=0 (Qwen) first - GPU bound, limited parallelism
-    qwen_tasks = [
-        (frame_idx, frame, 0, seed_base + frame_idx * 100000, frame_idx % num_nodes)
-        for frame_idx, frame in enumerate(frames)
-    ]
+        tasks = [
+            (fi, f, seed_base + fi * 100000, fi % num_nodes)
+            for fi, f in enumerate(frames)
+        ]
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(process_frame_aug, t): t for t in qwen_tasks}
-        for future in tqdm(
-            as_completed(futures), total=len(qwen_tasks), desc="Qwen (aug=0)"
-        ):
-            frame_idx, aug_idx, new_frame = future.result()
-            all_results[aug_idx][frame_idx] = new_frame
+        if aug_idx == 0:
+            actual_workers = min(max_workers, num_frames)
+            desc = "Qwen (aug=0)"
+        else:
+            actual_workers = min(max_workers * 2, num_frames, 64)
+            desc = f"TorchVision (aug={aug_idx})"
 
-    # Process aug_idx=1-19 (TorchVision) - CPU bound, high parallelism
-    torchvision_tasks = [
-        (frame_idx, frame, aug_idx, seed_base + frame_idx * 100000, 0)
-        for aug_idx in range(1, n_augment)
-        for frame_idx, frame in enumerate(frames)
-    ]
+        with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = {executor.submit(process_frame, t): t for t in tasks}
+            for future in tqdm(
+                as_completed(futures), total=len(tasks), desc=desc, leave=False
+            ):
+                fi, new_frame = future.result()
+                aug_results[fi] = new_frame
+            futures.clear()
 
-    # Use more workers for CPU-bound TorchVision tasks
-    tv_workers = min(max_workers * 4, 64, len(torchvision_tasks))
+        # Save this aug_idx as one episode immediately
+        for fi in range(num_frames):
+            dst_ds.add_frame(aug_results[fi])
+            aug_results[fi] = None  # Release each frame after adding
+        dst_ds.save_episode()
 
-    with ThreadPoolExecutor(max_workers=tv_workers) as executor:
-        futures = {executor.submit(process_frame_aug, t): t for t in torchvision_tasks}
-        for future in tqdm(
-            as_completed(futures),
-            total=len(torchvision_tasks),
-            desc=f"TorchVision (aug=1-{n_augment - 1})",
-        ):
-            frame_idx, aug_idx, new_frame = future.result()
-            all_results[aug_idx][frame_idx] = new_frame
+        # Release memory for this aug_idx
+        del aug_results
+        force_memory_release()
 
-    return all_results
+
+# =============================================================================
+# Snapshot helpers (Fix #5: rsync for constant memory)
+# =============================================================================
+
+
+def _get_dataset_dir(repo_id: str) -> str:
+    """Get the local filesystem path for a dataset repo_id."""
+    return os.path.join(
+        os.environ.get(
+            "HF_LEROBOT_HOME",
+            os.path.expanduser("~/.cache/huggingface/lerobot/lerobot"),
+        ),
+        repo_id,
+    )
+
+
+def _snapshot_dataset(dst_repo_id: str) -> None:
+    """
+    Create a snapshot of the finalized dataset as {dst_repo_id}_tmp.
+    Uses rsync for streaming copy with constant memory usage.
+    """
+    src_dir = _get_dataset_dir(dst_repo_id)
+    tmp_dir = _get_dataset_dir(f"{dst_repo_id}_tmp")
+
+    if not os.path.exists(src_dir):
+        return
+
+    os.makedirs(tmp_dir, exist_ok=True)
+
+    subprocess.run(
+        ["rsync", "-a", "--delete", f"{src_dir}/", f"{tmp_dir}/"],
+        check=True,
+    )
+    logger.info(f"Snapshot saved: {tmp_dir}")
 
 
 # =============================================================================
@@ -698,19 +661,16 @@ def augment_dataset(
     n_augment: int = N_AUGMENT,
     max_workers: int = 16,
     start_episode: int = 0,
-    num_episodes: Optional[int] = None,
+    end_episode: Optional[int] = None,
     overlay_alpha: float = 0.0,
     resume: bool = False,
 ) -> None:
     """
-    Dataset augmentation (Memory-efficient version):
-    - Processes one aug_idx at a time
-    - Saves episode immediately after processing
-    - Releases memory before moving to next aug_idx
+    Dataset augmentation (Memory-efficient version).
 
     Args:
-        start_episode: Episode index to start from (0-based)
-        num_episodes: Number of episodes to process (None = all remaining)
+        start_episode: Episode index to start from (0-based, inclusive)
+        end_episode: Episode index to end at (0-based, inclusive). None = last episode.
         resume: If True, resume from where it left off (auto-detect start_episode)
     """
     global _api_client
@@ -727,46 +687,108 @@ def augment_dataset(
     logger.info(f"Augmentation: 1 frame -> {n_augment} frames")
     logger.info("  - aug_idx=0: Server (SAM3 + Qwen)")
     logger.info(f"  - aug_idx=1-{n_augment - 1}: Client (TorchVision)")
-    logger.info("Memory-efficient mode: processing one aug_idx at a time")
 
+    # Load original dataset to extract metadata, then release
     original_ds = LeRobotDataset(src_repo_id)
+    original_fps = original_ds.meta.info["fps"]
+    original_features = original_ds.meta.info["features"]
+    original_robot_type = original_ds.meta.info["robot_type"]
+    meta_episodes = {
+        "dataset_from_index": list(original_ds.meta.episodes["dataset_from_index"]),
+        "dataset_to_index": list(original_ds.meta.episodes["dataset_to_index"]),
+    }
+    total_available = len(meta_episodes["dataset_from_index"])
+    del original_ds
+    force_memory_release()
 
-    # Check if resuming from existing dataset
+    # =========================================================================
+    # Resume logic (Fix #4B: modulo-based snapshot restore)
+    # =========================================================================
     dst_ds = None
-    resumed_episodes = 0
+    tmp_repo_id = f"{dst_repo_id}_tmp"
 
     if resume:
-        try:
-            existing_ds = LeRobotDataset(dst_repo_id)
-            existing_episodes = existing_ds.num_episodes
-            # Each source episode produces n_augment augmented episodes
-            resumed_episodes = existing_episodes // n_augment
-            logger.info(f"Found existing dataset with {existing_episodes} episodes")
-            logger.info(
-                f"Resuming from source episode {resumed_episodes} (skipping {resumed_episodes} already processed)"
-            )
+        loaded_from = None
+        existing_episodes = 0
+        resumed_episodes = 0
 
-            # Override start_episode with resumed position
+        for try_repo_id, label in [
+            (dst_repo_id, "main dataset"),
+            (tmp_repo_id, "snapshot (_tmp)"),
+        ]:
+            try:
+                existing_ds = LeRobotDataset(try_repo_id)
+                existing_episodes = existing_ds.num_episodes
+                resumed_episodes = existing_episodes // n_augment
+                logger.info(
+                    f"Found {label} with {existing_episodes} episodes "
+                    f"({resumed_episodes} source episodes completed)"
+                )
+                loaded_from = try_repo_id
+                del existing_ds
+                force_memory_release()
+                break
+            except Exception as e:
+                logger.info(f"Could not load {label} ({try_repo_id}): {e}")
+
+        if loaded_from is not None and resumed_episodes > 0:
+            # If main dataset has incomplete source episode, restore from snapshot
+            if loaded_from == dst_repo_id and existing_episodes % n_augment != 0:
+                logger.warning(
+                    f"Main dataset has {existing_episodes} episodes "
+                    f"(not divisible by {n_augment}). "
+                    f"Interrupted mid-episode. Restoring from snapshot..."
+                )
+                tmp_dir = _get_dataset_dir(tmp_repo_id)
+                if os.path.exists(tmp_dir):
+                    try:
+                        tmp_ds = LeRobotDataset(tmp_repo_id)
+                        tmp_episodes = tmp_ds.num_episodes
+                        resumed_episodes = tmp_episodes // n_augment
+                        del tmp_ds
+                        force_memory_release()
+
+                        dst_dir = _get_dataset_dir(dst_repo_id)
+                        if os.path.exists(dst_dir):
+                            shutil.rmtree(dst_dir)
+                        shutil.copytree(tmp_dir, dst_dir)
+                        logger.info(
+                            f"Restored from snapshot: {tmp_episodes} episodes "
+                            f"({resumed_episodes} source episodes)"
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Main dataset is incomplete and snapshot restore failed: {e}\n"
+                            f"Please inspect manually."
+                        )
+                else:
+                    raise RuntimeError(
+                        f"Main dataset has {existing_episodes} episodes "
+                        f"(incomplete, not divisible by {n_augment}) "
+                        f"and no snapshot found. Cannot resume safely."
+                    )
+
+            # If loaded from snapshot directly (main dataset unreadable)
+            elif loaded_from == tmp_repo_id:
+                logger.info("Restoring snapshot to main dataset directory...")
+                dst_dir = _get_dataset_dir(dst_repo_id)
+                tmp_dir = _get_dataset_dir(tmp_repo_id)
+                if os.path.exists(dst_dir):
+                    shutil.rmtree(dst_dir)
+                shutil.copytree(tmp_dir, dst_dir)
+                logger.info(f"Restored {tmp_dir} -> {dst_dir}")
+
             start_episode = resumed_episodes
-
-            # Open in append mode
-            dst_ds = existing_ds
+            dst_ds = LeRobotDataset(dst_repo_id)
             dst_ds.start_image_writer(
                 num_processes=32,
                 num_threads=2,
             )
-        except Exception as e:
-            logger.info(f"No existing dataset found or error loading: {e}")
-            logger.info("Starting from scratch...")
+        else:
+            logger.info("No usable dataset found. Starting from scratch...")
             resume = False
 
-            dst_path = os.path.join(
-                os.environ.get(
-                    "HF_LEROBOT_HOME",
-                    os.path.expanduser("~/.cache/huggingface/lerobot/lerobot"),
-                ),
-                dst_repo_id,
-            )
+            dst_path = _get_dataset_dir(dst_repo_id)
             if os.path.exists(dst_path):
                 logger.warning(f"Removing incomplete dataset directory: {dst_path}")
                 shutil.rmtree(dst_path)
@@ -774,22 +796,22 @@ def augment_dataset(
     if dst_ds is None:
         dst_ds = LeRobotDataset.create(
             repo_id=dst_repo_id,
-            fps=original_ds.meta.info["fps"],
-            features=original_ds.meta.info["features"],
-            robot_type=original_ds.meta.info["robot_type"],
+            fps=original_fps,
+            features=original_features,
+            robot_type=original_robot_type,
             use_videos=True,
             image_writer_processes=32,
             image_writer_threads=2,
         )
 
     start = time.time()
-    meta_episodes = original_ds.meta.episodes
-    total_available = len(meta_episodes["dataset_from_index"])
 
     # Calculate episode range
     ep_start = min(start_episode, total_available)
-    if num_episodes is not None:
-        ep_end = min(ep_start + num_episodes, total_available)
+    if end_episode is not None:
+        ep_end = min(
+            end_episode + 1, total_available
+        )  # +1 because end_episode is inclusive
     else:
         ep_end = total_available
 
@@ -803,59 +825,70 @@ def augment_dataset(
     for ep_idx in tqdm(range(ep_start, ep_end), desc="Episodes"):
         start_idx = meta_episodes["dataset_from_index"][ep_idx]
         end_idx = meta_episodes["dataset_to_index"][ep_idx]
-        new_task = generate_similar_instructions(original_ds[start_idx]["task"])
 
-        # Load frames once per episode
+        # Fix #1: Reload original_ds each episode to prevent HF cache buildup
+        original_ds = LeRobotDataset(src_repo_id)
+        new_task = generate_similar_instructions(original_ds[start_idx]["task"])
         frames = [original_ds[idx] for idx in range(start_idx, end_idx)]
+        del original_ds
+        force_memory_release()
+
         logger.info(f"Episode {ep_idx}: {len(frames)} frames")
 
-        # Process all frames for all aug_idx in parallel
-        all_results = process_episode_all_augs_parallel(
+        # Fix #4A: Process one aug_idx at a time, save immediately
+        process_episode_all_augs_sequential_save(
             frames=frames,
             task=new_task,
             n_augment=n_augment,
             seed_base=ep_idx * 1000000,
             max_workers=max_workers,
+            dst_ds=dst_ds,
             overlay_alpha=overlay_alpha,
         )
 
-        # Save each aug_idx as a separate episode
-        for aug_idx in range(n_augment):
-            for frame_idx in range(len(frames)):
-                dst_ds.add_frame(all_results[aug_idx][frame_idx])
-            dst_ds.save_episode()
-
-        # Release memory
-        del all_results
+        # Release frames
         del frames
-        gc.collect()
+        force_memory_release()
 
         # Log memory usage
         mem_mb = get_memory_usage_mb()
         logger.info(f"Episode {ep_idx} complete. Memory: {mem_mb:.1f} MB")
 
-        # Finalize and recreate dataset every episode to flush memory
+        # Fix #2: Finalize, then explicit del before recreate
         logger.info(f"Finalizing dataset after episode {ep_idx}...")
         dst_ds.finalize()
+        del dst_ds
+        dst_ds = None
+        force_memory_release()
+
+        # Fix #5: Snapshot with rsync (constant memory)
+        logger.info(f"Creating snapshot after episode {ep_idx}...")
+        _snapshot_dataset(dst_repo_id)
 
         # Recreate dataset in append mode if more episodes to process
         if ep_idx < ep_end - 1:
             dst_ds = LeRobotDataset(dst_repo_id)
-            # Re-enable write mode
             dst_ds.start_image_writer(
                 num_processes=32,
                 num_threads=2,
             )
 
+            mem_mb = get_memory_usage_mb()
+            logger.info(f"Reopened dataset for next episode. Memory: {mem_mb:.1f} MB")
+
     diff_time = time.time() - start
     logger.info(f"Total time: {diff_time:.2f}s")
 
-    # Merge (reload the finalized augmented dataset)
+    # Merge (reload datasets fresh)
+    force_memory_release()
+    original_ds = LeRobotDataset(src_repo_id)
     aug_ds = LeRobotDataset(dst_repo_id)
     merged = merge_datasets(
         [original_ds, aug_ds], output_repo_id=f"{dst_repo_id}_merged"
     )
     merged.finalize()
+    del original_ds, aug_ds, merged
+    force_memory_release()
 
     logger.info(f"Done! Saved to: {dst_repo_id}")
 
@@ -885,10 +918,10 @@ def main():
         help="Episode index to start from (0-based)",
     )
     p.add_argument(
-        "--num-episodes",
+        "--end-episode",
         type=int,
         default=None,
-        help="Number of episodes to process (None = all remaining)",
+        help="Episode index to end at (0-based, inclusive). None = last episode.",
     )
     p.add_argument(
         "--resume",
@@ -921,7 +954,7 @@ def main():
         n_augment=args.n_augment,
         max_workers=args.max_workers,
         start_episode=args.start_episode,
-        num_episodes=args.num_episodes,
+        end_episode=args.end_episode,
         overlay_alpha=args.overlay_alpha,
         resume=args.resume,
     )
