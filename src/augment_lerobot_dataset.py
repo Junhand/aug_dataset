@@ -62,8 +62,9 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 
-# SEGMENT_TASKS = "shelf, object, pet bottle, container, box"  # task05
-SEGMENT_TASKS = "box, oven, microwave oven, object, food, dish, table, plate, toy, stuffed toy"  # task48
+SEGMENT_TASKS = "shelf, object, pet bottle, container, box, plastic bottle, bottle cap, beverage bottle"  # task05
+# SEGMENT_TASKS = "towel, gray towel, brown towel, hanging fabric, towel on the rack, towel rack, silver metal frame, drying rack" # task40
+# SEGMENT_TASKS = "box, oven, microwave oven, object, food, dish, table, plate, toy, stuffed toy"  # task48
 
 # Augmentation multiplier: 1 original -> N_AUGMENT frames
 N_AUGMENT = 20
@@ -664,6 +665,7 @@ def augment_dataset(
     end_episode: Optional[int] = None,
     overlay_alpha: float = 0.0,
     resume: bool = False,
+    finalize_interval: int = 50,
 ) -> None:
     """
     Dataset augmentation (Memory-efficient version).
@@ -672,6 +674,8 @@ def augment_dataset(
         start_episode: Episode index to start from (0-based, inclusive)
         end_episode: Episode index to end at (0-based, inclusive). None = last episode.
         resume: If True, resume from where it left off (auto-detect start_episode)
+        finalize_interval: Finalize dataset every N source episodes (default: 50).
+                           Controls chunk granularity and memory release frequency.
     """
     global _api_client
     _api_client = QwenImageEditClient(api_urls)
@@ -822,6 +826,9 @@ def augment_dataset(
     )
     logger.info(f"Output: {total_to_process * n_augment} augmented episodes")
 
+    # Track source episodes processed since last finalize
+    episodes_since_finalize = 0
+
     for ep_idx in tqdm(range(ep_start, ep_end), desc="Episodes"):
         start_idx = meta_episodes["dataset_from_index"][ep_idx]
         end_idx = meta_episodes["dataset_to_index"][ep_idx]
@@ -850,31 +857,45 @@ def augment_dataset(
         del frames
         force_memory_release()
 
+        episodes_since_finalize += 1
+        is_last_episode = ep_idx == ep_end - 1
+        should_finalize = is_last_episode or (
+            episodes_since_finalize >= finalize_interval
+        )
+
         # Log memory usage
         mem_mb = get_memory_usage_mb()
         logger.info(f"Episode {ep_idx} complete. Memory: {mem_mb:.1f} MB")
 
-        # Fix #2: Finalize, then explicit del before recreate
-        logger.info(f"Finalizing dataset after episode {ep_idx}...")
-        dst_ds.finalize()
-        del dst_ds
-        dst_ds = None
-        force_memory_release()
-
-        # Fix #5: Snapshot with rsync (constant memory)
-        logger.info(f"Creating snapshot after episode {ep_idx}...")
-        _snapshot_dataset(dst_repo_id)
-
-        # Recreate dataset in append mode if more episodes to process
-        if ep_idx < ep_end - 1:
-            dst_ds = LeRobotDataset(dst_repo_id)
-            dst_ds.start_image_writer(
-                num_processes=32,
-                num_threads=2,
+        if should_finalize:
+            # Fix #2: Finalize, then explicit del before recreate
+            logger.info(
+                f"Finalizing dataset after {episodes_since_finalize} source episodes "
+                f"(ep {ep_idx})..."
             )
+            dst_ds.finalize()
+            del dst_ds
+            dst_ds = None
+            force_memory_release()
 
-            mem_mb = get_memory_usage_mb()
-            logger.info(f"Reopened dataset for next episode. Memory: {mem_mb:.1f} MB")
+            # Fix #5: Snapshot with rsync (constant memory)
+            logger.info(f"Creating snapshot after episode {ep_idx}...")
+            _snapshot_dataset(dst_repo_id)
+
+            episodes_since_finalize = 0
+
+            # Recreate dataset in append mode if more episodes to process
+            if not is_last_episode:
+                dst_ds = LeRobotDataset(dst_repo_id)
+                dst_ds.start_image_writer(
+                    num_processes=32,
+                    num_threads=2,
+                )
+
+                mem_mb = get_memory_usage_mb()
+                logger.info(
+                    f"Reopened dataset for next episode. Memory: {mem_mb:.1f} MB"
+                )
 
     diff_time = time.time() - start
     logger.info(f"Total time: {diff_time:.2f}s")
@@ -928,6 +949,13 @@ def main():
         action="store_true",
         help="Resume from existing dataset (auto-detect start position)",
     )
+    p.add_argument(
+        "--finalize-interval",
+        type=int,
+        default=5,
+        help="Finalize dataset every N source episodes (default: 50). "
+        "Controls chunk granularity and memory release frequency.",
+    )
     p.add_argument("--offline", action="store_true")
     p.add_argument(
         "--overlay-alpha",
@@ -957,6 +985,7 @@ def main():
         end_episode=args.end_episode,
         overlay_alpha=args.overlay_alpha,
         resume=args.resume,
+        finalize_interval=args.finalize_interval,
     )
 
 

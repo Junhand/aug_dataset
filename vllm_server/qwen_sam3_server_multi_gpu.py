@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 # Configuration
 MAX_QUEUE_SIZE = 1000
 REQUEST_TIMEOUT = 3000
-NUM_GPUS = 8
+NUM_GPUS = 7
 JPEG_QUALITY = 95
 
 # Model paths

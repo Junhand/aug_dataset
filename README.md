@@ -37,7 +37,7 @@ Qwen-Image-Edit-2511の利用
 conda create --prefix ./.edit_env python=3.12
 conda activate .image_envの環境先
 
-pip install diffusers accelerate transformers
+pip install diffusers accelerate transformers bitsandbytes
 pip install "huggingface_hub[cli]"
 
 # モデルのインストール
